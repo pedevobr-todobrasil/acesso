@@ -741,6 +741,7 @@ function Categories() {
 
   async function moveCategory(index: number, direction: -1 | 1) {
     if (!supabase) return
+    const db = supabase
     const targetIndex = index + direction
     if (targetIndex < 0 || targetIndex >= categories.length) return
     const reordered = [...categories]
@@ -748,7 +749,7 @@ function Categories() {
     reordered.splice(targetIndex, 0, moved)
     const normalized = reordered.map((category, sortIndex) => ({ ...category, sort_order: sortIndex }))
     setCategories(normalized)
-    const updates = await Promise.all(normalized.map((category) => supabase.from('categories').update({ sort_order: category.sort_order }).eq('id', category.id)))
+    const updates = await Promise.all(normalized.map((category) => db.from('categories').update({ sort_order: category.sort_order }).eq('id', category.id)))
     const failed = updates.find((result) => result.error)
     if (failed?.error) {
       setError(failed.error.message)
