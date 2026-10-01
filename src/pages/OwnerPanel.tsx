@@ -153,9 +153,10 @@ function DashboardHome() {
 
   useEffect(() => {
     if (!supabase || !store?.id) return
-    const channel = supabase.channel(`owner-new-orders-${store.id}`).on('postgres_changes',{event:'INSERT',schema:'public',table:'orders',filter:`store_id=eq.${store.id}`},async(payload:any)=>{
+    const client = supabase
+    const channel = client.channel(`owner-new-orders-${store.id}`).on('postgres_changes',{event:'INSERT',schema:'public',table:'orders',filter:`store_id=eq.${store.id}`},async(payload:any)=>{
       const inserted=payload.new||{}
-      const {data}=await supabase.from('orders').select('id,order_number,order_type,total,status,created_at,customer:customers(name)').eq('id',inserted.id).maybeSingle()
+      const {data}=await client.from('orders').select('id,order_number,order_type,total,status,created_at,customer:customers(name)').eq('id',inserted.id).maybeSingle()
       const order=data||inserted
       const orderId=String(order.id||inserted.id||'')
       const orderNumber=order.order_number||String(orderId).slice(0,6)
@@ -168,7 +169,7 @@ function DashboardHome() {
       if(store.new_order_flash_enabled!==false&&orderId) setHighlightedOrderIds((current)=>Array.from(new Set([orderId,...current])))
       window.setTimeout(()=>{setNewOrderAlert((current:any)=>current?.id===orderId?null:current);setHighlightedOrderIds((current)=>current.filter((id)=>id!==orderId))},30000)
     }).subscribe()
-    return ()=>{void supabase.removeChannel(channel)}
+    return ()=>{void client.removeChannel(channel)}
   },[store?.id,store?.new_order_sound_enabled,store?.new_order_flash_enabled])
 
   async function closeCashRegister() {
