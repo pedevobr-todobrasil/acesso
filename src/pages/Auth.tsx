@@ -27,23 +27,57 @@ export default function Auth({ mode, area = 'owner' }: { mode: 'login' | 'signup
       if (result.error) return setError(result.error.message)
       if (result.demo) return navigate('/onboarding')
       setMessage('Conta criada. Se a confirmação por e-mail estiver ativada no Supabase, confirme seu e-mail antes de entrar.')
-    } else {
-      const result = await signIn(email, password)
-      setLoading(false)
-      if (result.error) return setError(result.error.message)
-      if (area === 'admin') {
-        if (!supabase) return setError('Supabase não configurado.')
-        const adminCheck = await supabase.rpc('is_pedevo_admin')
-        if (adminCheck.error) return setError(adminCheck.error.message)
-        if (!adminCheck.data) {
-          await supabase.auth.signOut()
-          return setError('Esta conta não possui permissão de administrador do Pedevo.')
-        }
-        navigate('/admin')
-        return
-      }
-      navigate('/painel')
+      return
     }
+
+    const result = await signIn(email, password)
+    if (result.error) {
+      setLoading(false)
+      return setError(result.error.message)
+    }
+
+    if (!supabase) {
+      setLoading(false)
+      navigate(area === 'admin' ? '/admin' : '/painel')
+      return
+    }
+
+    if (area === 'admin') {
+      const adminCheck = await supabase.rpc('is_pedevo_admin')
+      setLoading(false)
+      if (adminCheck.error) return setError(adminCheck.error.message)
+      if (!adminCheck.data) {
+        await supabase.auth.signOut()
+        return setError('Esta conta não possui permissão de administrador do Pedevo.')
+      }
+      navigate('/admin')
+      return
+    }
+
+    // Na entrada do lojista, a propriedade da loja tem prioridade.
+    // Isso evita que uma conta que também esteja cadastrada em admin_users
+    // seja desviada indevidamente para o Painel Master.
+    const ownerCheck = await supabase.rpc('is_store_owner')
+    if (ownerCheck.error) {
+      setLoading(false)
+      return setError(ownerCheck.error.message)
+    }
+
+    if (ownerCheck.data) {
+      setLoading(false)
+      navigate('/painel')
+      return
+    }
+
+    const adminCheck = await supabase.rpc('is_pedevo_admin')
+    setLoading(false)
+    if (!adminCheck.error && adminCheck.data) {
+      await supabase.auth.signOut()
+      return setError('Esta é uma conta administrativa. Entre pelo acesso do Painel Master.')
+    }
+
+    // Conta autenticada, mas ainda sem loja: continua o cadastro.
+    navigate('/onboarding')
   }
 
   return <div className="authPage">

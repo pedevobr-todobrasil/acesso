@@ -1,10 +1,11 @@
-import { AlertTriangle, BarChart3, Bike, Box, CalendarDays, CheckCircle2, Clock3, Copy, CreditCard, DollarSign, Eye, MapPin, Package, Pencil, Plus, Search, Settings, ShieldCheck, ShoppingBag, Store, Tags, Trash2, Users, XCircle } from 'lucide-react'
+import { AlertTriangle, BarChart3, BellRing, Bike, Box, CalendarDays, CheckCircle2, Clock3, Copy, CreditCard, DollarSign, Eye, MapPin, MessageCircle, Package, Pencil, Plus, Search, Settings, ShieldCheck, ShoppingBag, Store, Tags, Trash2, Users, Volume2, VolumeX, XCircle } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import OwnerShell from '../components/OwnerShell'
+import SecuritySettings from '../components/SecuritySettings'
 import StatCard from '../components/StatCard'
 import { formatBRL, statusLabel } from '../lib/format'
-import { createProduct, getOwnedStore, uploadProductImage } from '../lib/pedevoApi'
+import { createProduct, getOwnedStore, markManualPixPaid, saveMercadoPagoToken, sendOrderWhatsapp, uploadProductImage } from '../lib/pedevoApi'
 import { supabase } from '../lib/supabase'
 import type { OpeningHours, Product } from '../types'
 
@@ -22,20 +23,48 @@ function daysRemaining(value?: string | null) {
   return Math.max(0, Math.ceil((new Date(value).getTime() - Date.now()) / 86400000))
 }
 
+function playNewOrderSound() {
+  try {
+    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext
+    if (!AudioCtx) return
+    const ctx = new AudioCtx()
+    const notes = [880, 1174, 1568]
+    notes.forEach((frequency, index) => {
+      const oscillator = ctx.createOscillator()
+      const gain = ctx.createGain()
+      oscillator.type = 'sine'
+      oscillator.frequency.value = frequency
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime + index * 0.16)
+      gain.gain.exponentialRampToValueAtTime(0.18, ctx.currentTime + index * 0.16 + 0.02)
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + index * 0.16 + 0.13)
+      oscillator.connect(gain)
+      gain.connect(ctx.destination)
+      oscillator.start(ctx.currentTime + index * 0.16)
+      oscillator.stop(ctx.currentTime + index * 0.16 + 0.14)
+    })
+    window.setTimeout(() => { try { void ctx.close() } catch {} }, 800)
+  } catch {
+    // Alguns navegadores bloqueiam áudio até a primeira interação do usuário.
+  }
+}
+
 function subscriptionMeta(subscription: any) {
   if (!subscription) return { label: 'Não encontrada', tone: 'blocked', detail: 'Fale com o suporte Pedevo.', canOrder: false }
-  if (subscription.status === 'pending') return { label: 'Aguardando ativação', tone: 'pending', detail: `Adesão de ${formatBRL(Number(subscription.signup_fee || 29.9))} pendente.`, canOrder: false }
+  const planName = subscription.plan_name || 'Plano Pedevo'
+  const cycleMonths = Number(subscription.renewal_months || 1)
+  const cycleLabel = cycleMonths === 1 ? 'mês' : `${cycleMonths} meses`
+  if (subscription.status === 'pending') return { label: 'Aguardando ativação', tone: 'pending', detail: `${planName} • pagamento inicial de ${formatBRL(Number(subscription.signup_fee || 0))} pendente.`, canOrder: false }
   if (subscription.status === 'trial') {
     const days = daysRemaining(subscription.included_until)
     const valid = days > 0
-    return { label: valid ? 'Período inicial' : 'Período encerrado', tone: valid ? 'trial' : 'overdue', detail: valid ? `${days} dia(s) restante(s) • até ${dateBR(subscription.included_until)}` : 'Os 60 dias foram encerrados.', canOrder: valid }
+    return { label: valid ? planName : 'Período encerrado', tone: valid ? 'trial' : 'overdue', detail: valid ? `${days} dia(s) restante(s) • até ${dateBR(subscription.included_until)}` : `O período de acesso do ${planName} foi encerrado.`, canOrder: valid }
   }
   if (subscription.status === 'active') {
     const due = subscription.current_period_end || subscription.next_charge_at
     const valid = !due || new Date(due).getTime() >= Date.now()
-    return { label: valid ? 'Plano mensal ativo' : 'Mensalidade vencida', tone: valid ? 'active' : 'overdue', detail: due ? `Próxima cobrança: ${dateBR(due)} • ${formatBRL(Number(subscription.monthly_price || 19.9))}` : `Mensalidade ${formatBRL(Number(subscription.monthly_price || 19.9))}`, canOrder: valid }
+    return { label: valid ? `${planName} ativo` : 'Renovação vencida', tone: valid ? 'active' : 'overdue', detail: due ? `Próxima renovação: ${dateBR(due)} • ${formatBRL(Number(subscription.monthly_price || 0))} / ${cycleLabel}` : `Renovação ${formatBRL(Number(subscription.monthly_price || 0))} / ${cycleLabel}`, canOrder: valid }
   }
-  if (subscription.status === 'overdue') return { label: 'Pagamento pendente', tone: 'overdue', detail: `Mensalidade de ${formatBRL(Number(subscription.monthly_price || 19.9))} pendente.`, canOrder: false }
+  if (subscription.status === 'overdue') return { label: 'Pagamento pendente', tone: 'overdue', detail: `Renovação de ${formatBRL(Number(subscription.monthly_price || 0))} pendente.`, canOrder: false }
   if (subscription.status === 'blocked') return { label: 'Assinatura bloqueada', tone: 'blocked', detail: 'Novos pedidos estão pausados até a regularização.', canOrder: false }
   return { label: 'Assinatura cancelada', tone: 'blocked', detail: 'A loja não está recebendo novos pedidos.', canOrder: false }
 }
@@ -55,6 +84,25 @@ export default function OwnerPanel() {
   </OwnerShell>
 }
 
+function operationalStart(store: any) {
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  if (!store?.last_cash_closed_at) return today
+  const lastClose = new Date(store.last_cash_closed_at)
+  return lastClose.getTime() > today.getTime() ? lastClose : today
+}
+
+function PaginationControls({ page, pageSize, total, onPage, onPageSize }: { page: number; pageSize: number; total: number; onPage: (page: number) => void; onPageSize: (size: number) => void }) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const safePage = Math.min(Math.max(1, page), totalPages)
+  const start = total === 0 ? 0 : (safePage - 1) * pageSize + 1
+  const end = Math.min(total, safePage * pageSize)
+  return <div className="orderPagination">
+    <div className="pageSizeSelector"><span>Pedidos por página</span><select value={pageSize} onChange={(e)=>onPageSize(Number(e.target.value))}><option value={10}>10</option><option value={30}>30</option><option value={50}>50</option></select></div>
+    <div className="pageCounter"><span>{total ? `${start}–${end} de ${total}` : '0 pedidos'}</span><button type="button" className="miniButton" disabled={safePage <= 1} onClick={()=>onPage(safePage - 1)}>← Anterior</button><strong>{safePage} / {totalPages}</strong><button type="button" className="miniButton" disabled={safePage >= totalPages} onClick={()=>onPage(safePage + 1)}>Próxima →</button></div>
+  </div>
+}
+
 function DashboardHome() {
   const [loading, setLoading] = useState(true)
   const [store, setStore] = useState<any>(null)
@@ -62,194 +110,152 @@ function DashboardHome() {
   const [recentOrders, setRecentOrders] = useState<any[]>([])
   const [weekSales, setWeekSales] = useState<number[]>([0, 0, 0, 0, 0, 0, 0])
   const [subscription, setSubscription] = useState<any>(null)
+  const [newOrderAlert, setNewOrderAlert] = useState<any>(null)
+  const [highlightedOrderIds, setHighlightedOrderIds] = useState<string[]>([])
+  const [pageSize, setPageSize] = useState(10)
+  const [page, setPage] = useState(1)
+  const [closingCash, setClosingCash] = useState(false)
+  const [cashMessage, setCashMessage] = useState('')
+  const [cashError, setCashError] = useState('')
 
-  useEffect(() => {
-    let mounted = true
+  async function loadDashboard() {
+    if (!supabase) { setLoading(false); return }
+    const { data: ownedStore } = await getOwnedStore()
+    if (!ownedStore) { setLoading(false); return }
+    setStore(ownedStore)
 
-    async function loadDashboard() {
-      if (!supabase) {
-        setLoading(false)
-        return
-      }
+    // Limpeza de retenção também é executada ao abrir o painel. O Cron do Supabase faz isso em segundo plano quando habilitado.
+    try { await supabase.rpc('cleanup_my_expired_orders') } catch {}
 
-      const { data: ownedStore } = await getOwnedStore()
-      if (!mounted || !ownedStore) {
-        setLoading(false)
-        return
-      }
-      setStore(ownedStore)
-
-      const startToday = new Date()
-      startToday.setHours(0, 0, 0, 0)
-
-      const startWeek = new Date()
-      startWeek.setDate(startWeek.getDate() - 6)
-      startWeek.setHours(0, 0, 0, 0)
-
-      const [todayResult, customerResult, productResult, recentResult, weekResult, subscriptionResult] = await Promise.all([
-        supabase
-          .from('orders')
-          .select('id,total,status,created_at')
-          .eq('store_id', ownedStore.id)
-          .gte('created_at', startToday.toISOString()),
-        supabase
-          .from('customers')
-          .select('id', { count: 'exact', head: true })
-          .eq('store_id', ownedStore.id),
-        supabase
-          .from('products')
-          .select('id', { count: 'exact', head: true })
-          .eq('store_id', ownedStore.id)
-          .eq('active', true),
-        supabase
-          .from('orders')
-          .select('id,order_number,order_type,total,status,created_at,customer:customers(name)')
-          .eq('store_id', ownedStore.id)
-          .order('created_at', { ascending: false })
-          .limit(4),
-        supabase
-          .from('orders')
-          .select('total,status,created_at')
-          .eq('store_id', ownedStore.id)
-          .gte('created_at', startWeek.toISOString()),
-        supabase
-          .from('subscriptions')
-          .select('*')
-          .eq('store_id', ownedStore.id)
-          .maybeSingle(),
-      ])
-
-      if (!mounted) return
-
-      const todayOrders = todayResult.data || []
-      const salesToday = todayOrders
-        .filter((order: any) => order.status !== 'cancelled')
-        .reduce((sum: number, order: any) => sum + Number(order.total || 0), 0)
-
-      setStats({
-        ordersToday: todayOrders.length,
-        salesToday,
-        customers: customerResult.count || 0,
-        products: productResult.count || 0,
-      })
-      setRecentOrders(recentResult.data || [])
-      setSubscription(subscriptionResult.data || null)
-
-      const buckets = Array.from({ length: 7 }, (_, index) => {
-        const date = new Date(startWeek)
-        date.setDate(startWeek.getDate() + index)
-        return { key: date.toLocaleDateString('pt-BR'), total: 0 }
-      })
-      for (const order of weekResult.data || []) {
-        if (order.status === 'cancelled') continue
-        const key = new Date(order.created_at).toLocaleDateString('pt-BR')
-        const bucket = buckets.find((item) => item.key === key)
-        if (bucket) bucket.total += Number(order.total || 0)
-      }
-      setWeekSales(buckets.map((item) => item.total))
-      setLoading(false)
-    }
-
-    loadDashboard()
-    return () => { mounted = false }
-  }, [])
-
-  const averageTicket = stats.ordersToday ? stats.salesToday / stats.ordersToday : 0
-  const maxWeek = Math.max(...weekSales, 1)
-
-  if (loading) {
-    return <div className="ownerPage"><PageHeader title="Carregando painel..." description="Buscando os dados da sua loja no Supabase." /></div>
-  }
-
-  if (!store) {
-    return <div className="ownerPage"><PageHeader title="Sua loja ainda não foi encontrada" description="Conclua a configuração inicial para começar." action={<Link className="button" to="/onboarding">Configurar loja</Link>} /></div>
-  }
-
-  const subMeta = subscriptionMeta(subscription)
-  return <div className="ownerPage"><PageHeader title="Bom dia 👋" description={`Aqui está o resumo do ${store.name} hoje.`} action={<Link className="button secondary" to={`/loja/${store.slug}`}><Eye size={18}/> Ver minha loja</Link>}/>
-    <div className={`subscriptionNotice ${subMeta.tone}`}><div className="subscriptionNoticeIcon"><CalendarDays size={20}/></div><div><strong>{subMeta.label}</strong><span>{subMeta.detail}</span></div><Link to="/painel/configuracoes">Ver assinatura</Link></div>
-    <div className="ownerStats"><StatCard label="Pedidos hoje" value={String(stats.ordersToday)} helper="Dados reais" icon={ShoppingBag}/><StatCard label="Vendas hoje" value={formatBRL(stats.salesToday)} helper={`Ticket médio ${formatBRL(averageTicket)}`} icon={DollarSign}/><StatCard label="Clientes" value={String(stats.customers)} helper="Clientes cadastrados" icon={Users}/><StatCard label="Produtos ativos" value={String(stats.products)} helper="Disponíveis na loja" icon={Box}/></div>
-    <div className="ownerDashboardGrid">
-      <section className="panelCard"><div className="panelTitle"><div><h2>Pedidos recentes</h2><p>Acompanhe o andamento dos últimos pedidos.</p></div><Link to="/painel/pedidos">Ver todos</Link></div><DashboardOrdersTable rows={recentOrders}/></section>
-      <section className="panelCard"><div className="panelTitle"><div><h2>Ações rápidas</h2><p>Atalhos para tarefas frequentes.</p></div></div><div className="quickActions"><Link to="/painel/produtos"><Plus/><span><strong>Novo produto</strong><small>Cadastre item e preço</small></span></Link><Link to="/painel/entregas"><Bike/><span><strong>Taxas de entrega</strong><small>Configure bairros</small></span></Link><Link to="/painel/minha-loja"><Store/><span><strong>Editar loja</strong><small>Dados e aparência</small></span></Link><Link to="/painel/pagamentos"><CreditCard/><span><strong>Pagamentos</strong><small>Pix e formas aceitas</small></span></Link></div></section>
-    </div>
-    <section className="panelCard"><div className="panelTitle"><div><h2>Vendas dos últimos 7 dias</h2><p>Valores reais dos pedidos, exceto cancelados.</p></div></div><div className="fakeChart">{weekSales.map((value, index) => <div key={index} title={formatBRL(value)} style={{height:`${Math.max(8, Math.round((value / maxWeek) * 94))}%`}}></div>)}</div><div className="chartLabels"><span>6d</span><span>5d</span><span>4d</span><span>3d</span><span>2d</span><span>Ontem</span><span>Hoje</span></div></section>
-  </div>
-}
-
-function DashboardOrdersTable({ rows }: { rows: any[] }) {
-  if (!rows.length) return <div style={{padding:'28px 4px',color:'#697386'}}>Nenhum pedido recebido ainda.</div>
-  return <div className="tableWrap"><table className="dataTable"><thead><tr><th>Pedido</th><th>Cliente</th><th>Tipo</th><th>Total</th><th>Status</th><th>Hora</th></tr></thead><tbody>{rows.map((order) => {
-    const customer = Array.isArray(order.customer) ? order.customer[0]?.name : order.customer?.name
-    return <tr key={order.id}><td><strong>#{order.order_number || String(order.id).slice(0,6)}</strong></td><td>{customer || 'Cliente'}</td><td>{order.order_type === 'delivery' ? 'Delivery' : 'Retirada'}</td><td>{formatBRL(Number(order.total || 0))}</td><td><span className={`orderStatus ${order.status}`}>{statusLabel[order.status] || order.status}</span></td><td>{new Date(order.created_at).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}</td></tr>
-  })}</tbody></table></div>
-}
-
-function Orders() {
-  const [filter, setFilter] = useState('todos')
-  const [rows, setRows] = useState<any[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-  const [selectedId, setSelectedId] = useState<string | null>(null)
-
-  async function loadOrders() {
-    if (!supabase) {
-      setError('Supabase não configurado.')
-      setLoading(false)
-      return
-    }
-    const { data: store, error: storeError } = await getOwnedStore()
-    if (storeError || !store) {
-      setError(storeError?.message || 'Loja não encontrada.')
-      setLoading(false)
-      return
-    }
-    const result = await supabase
-      .from('orders')
-      .select('id,order_number,order_type,payment_method,subtotal,delivery_fee,total,status,delivery_address,notes,age_confirmed,created_at,customer:customers(name,whatsapp)')
-      .eq('store_id', store.id)
-      .order('created_at', { ascending: false })
-    if (result.error) setError(result.error.message)
-    else setRows(result.data || [])
+    const activeStart = operationalStart(ownedStore)
+    const startWeek = new Date(); startWeek.setDate(startWeek.getDate() - 6); startWeek.setHours(0,0,0,0)
+    const [todayResult, customerResult, productResult, recentResult, weekResult, subscriptionResult] = await Promise.all([
+      supabase.from('orders').select('id,total,status,created_at').eq('store_id', ownedStore.id).gte('created_at', activeStart.toISOString()),
+      supabase.from('customers').select('id', { count:'exact', head:true }).eq('store_id', ownedStore.id),
+      supabase.from('products').select('id', { count:'exact', head:true }).eq('store_id', ownedStore.id).eq('active', true),
+      supabase.from('orders').select('id,order_number,order_type,total,status,created_at,customer:customers(name)').eq('store_id', ownedStore.id).gte('created_at', activeStart.toISOString()).order('created_at',{ascending:false}),
+      supabase.from('orders').select('total,status,created_at').eq('store_id', ownedStore.id).gte('created_at', startWeek.toISOString()),
+      supabase.from('subscriptions').select('*').eq('store_id', ownedStore.id).maybeSingle(),
+    ])
+    const currentOrders = todayResult.data || []
+    const salesToday = currentOrders.filter((order:any)=>order.status !== 'cancelled').reduce((sum:number,order:any)=>sum+Number(order.total||0),0)
+    setStats({ ordersToday:currentOrders.length, salesToday, customers:customerResult.count||0, products:productResult.count||0 })
+    setRecentOrders(recentResult.data || [])
+    setSubscription(subscriptionResult.data || null)
+    const buckets = Array.from({length:7},(_,index)=>{ const date=new Date(startWeek); date.setDate(startWeek.getDate()+index); return {key:date.toLocaleDateString('pt-BR'),total:0} })
+    for (const order of weekResult.data || []) { if (order.status==='cancelled') continue; const key=new Date(order.created_at).toLocaleDateString('pt-BR'); const bucket=buckets.find((item)=>item.key===key); if(bucket) bucket.total += Number(order.total||0) }
+    setWeekSales(buckets.map((item)=>item.total))
+    setPage(1)
     setLoading(false)
   }
 
-  useEffect(() => { loadOrders() }, [])
+  useEffect(() => { let mounted=true; void loadDashboard(); return ()=>{mounted=false; void mounted} }, [])
 
-  const filtered = filter === 'todos' ? rows : rows.filter((order) => order.status === filter)
-  const selectedOrder = selectedId ? rows.find((row) => row.id === selectedId) || null : null
+  useEffect(() => {
+    if (!supabase || !store?.id) return
+    const channel = supabase.channel(`owner-new-orders-${store.id}`).on('postgres_changes',{event:'INSERT',schema:'public',table:'orders',filter:`store_id=eq.${store.id}`},async(payload:any)=>{
+      const inserted=payload.new||{}
+      const {data}=await supabase.from('orders').select('id,order_number,order_type,total,status,created_at,customer:customers(name)').eq('id',inserted.id).maybeSingle()
+      const order=data||inserted
+      const orderId=String(order.id||inserted.id||'')
+      const orderNumber=order.order_number||String(orderId).slice(0,6)
+      const customer=Array.isArray(order.customer)?order.customer[0]?.name:order.customer?.name
+      setRecentOrders((current)=>[order,...current.filter((item)=>item.id!==order.id)])
+      setStats((current)=>({...current,ordersToday:current.ordersToday+1,salesToday:current.salesToday+Number(order.total||0)}))
+      setNewOrderAlert({id:orderId,number:orderNumber,customer:customer||'Cliente',total:Number(order.total||0)})
+      setPage(1)
+      if(store.new_order_sound_enabled!==false) playNewOrderSound()
+      if(store.new_order_flash_enabled!==false&&orderId) setHighlightedOrderIds((current)=>Array.from(new Set([orderId,...current])))
+      window.setTimeout(()=>{setNewOrderAlert((current:any)=>current?.id===orderId?null:current);setHighlightedOrderIds((current)=>current.filter((id)=>id!==orderId))},30000)
+    }).subscribe()
+    return ()=>{void supabase.removeChannel(channel)}
+  },[store?.id,store?.new_order_sound_enabled,store?.new_order_flash_enabled])
 
-  async function updateStatus(orderId: string, status: string) {
-    if (!supabase) return
-    const old = rows.find((row) => row.id === orderId)?.status
-    setRows((current) => current.map((row) => row.id === orderId ? { ...row, status } : row))
-    const { error: updateError } = await supabase.from('orders').update({ status }).eq('id', orderId)
-    if (updateError) {
-      setRows((current) => current.map((row) => row.id === orderId ? { ...row, status: old } : row))
-      setError(updateError.message)
+  async function closeCashRegister() {
+    if (!supabase || !store?.id || closingCash) return
+    const activeStart = operationalStart(store)
+    const validOrders = recentOrders.filter((order:any)=>order.status !== 'cancelled')
+    const total = validOrders.reduce((sum:number,order:any)=>sum+Number(order.total||0),0)
+    const confirmation = `Fechar o caixa agora?\\n\\n${recentOrders.length} pedido(s) no caixa atual\\nFaturamento: ${formatBRL(total)}\\n\\nDepois do fechamento, esses pedidos sairão da operação e ficarão disponíveis em Relatórios até o prazo de retenção.`
+    if (!window.confirm(confirmation)) return
+    setClosingCash(true); setCashError(''); setCashMessage('')
+    const result = await supabase.rpc('close_cash_register',{p_store_id:store.id,p_opened_at:activeStart.toISOString()})
+    if (result.error) setCashError(result.error.message)
+    else {
+      const closedAt = result.data?.closed_at || new Date().toISOString()
+      setStore((current:any)=>({...current,last_cash_closed_at:closedAt}))
+      setRecentOrders([]); setStats((current)=>({...current,ordersToday:0,salesToday:0})); setPage(1); setNewOrderAlert(null); setHighlightedOrderIds([])
+      setCashMessage(`Caixa fechado. ${result.data?.orders_count ?? recentOrders.length} pedido(s) foram enviados para Relatórios.`)
     }
+    setClosingCash(false)
   }
 
-  return <div className="ownerPage"><PageHeader title="Pedidos" description="Receba, confira os itens e acompanhe cada pedido da sua loja."/>
-    {error && <div className="infoAlert" style={{marginBottom:16}}>{error}</div>}
-    <div className="filterTabs">{[['todos','Todos'],['pending','Novos'],['accepted','Aceitos'],['preparing','Preparando'],['out_for_delivery','Em entrega'],['ready','Prontos'],['completed','Finalizados'],['cancelled','Cancelados']].map(([value,label]) => <button key={value} onClick={()=>setFilter(value)} className={filter===value?'active':''}>{label}</button>)}</div>
-    <section className="panelCard">{loading ? <div style={{padding:'28px 4px',color:'#697386'}}>Carregando pedidos...</div> : <RealOrdersTable rows={filtered} onStatus={updateStatus} onOpen={setSelectedId}/>}</section>
-    {selectedOrder && <OrderDetailsModal order={selectedOrder} onClose={()=>setSelectedId(null)} onStatus={updateStatus}/>} 
+  const averageTicket=stats.ordersToday?stats.salesToday/stats.ordersToday:0
+  const maxWeek=Math.max(...weekSales,1)
+  const totalPages=Math.max(1,Math.ceil(recentOrders.length/pageSize))
+  const safePage=Math.min(page,totalPages)
+  const visibleOrders=recentOrders.slice((safePage-1)*pageSize,safePage*pageSize)
+  if(loading) return <div className="ownerPage"><PageHeader title="Carregando painel..." description="Buscando os dados da sua loja no Supabase." /></div>
+  if(!store) return <div className="ownerPage"><PageHeader title="Sua loja ainda não foi encontrada" description="Conclua a configuração inicial para começar." action={<Link className="button" to="/onboarding">Configurar loja</Link>} /></div>
+  const subMeta=subscriptionMeta(subscription)
+  return <div className="ownerPage"><PageHeader title="Bom dia 👋" description={`Aqui está o caixa atual do ${store.name}.`} action={<Link className="button secondary" to={`/loja/${store.slug}`}><Eye size={18}/> Ver minha loja</Link>}/>
+    <div className={`subscriptionNotice ${subMeta.tone}`}><div className="subscriptionNoticeIcon"><CalendarDays size={20}/></div><div><strong>{subMeta.label}</strong><span>{subMeta.detail}</span></div><Link to="/painel/configuracoes">Ver assinatura</Link></div>
+    <section className="cashRegisterBar"><div><Clock3/><span><strong>Caixa atual aberto</strong><small>Pedidos desde {operationalStart(store).toLocaleString('pt-BR')}. Feche o caixa ao encerrar o expediente.</small></span></div><button className="button cashCloseButton" type="button" disabled={closingCash} onClick={closeCashRegister}>{closingCash?'Fechando...':'Fechar caixa do dia'}</button></section>
+    {cashMessage&&<div className="successAlert">{cashMessage}</div>}{cashError&&<div className="infoAlert">{cashError}</div>}
+    {newOrderAlert&&<div className={`newOrderLiveAlert ${store.new_order_flash_enabled!==false?'pulse':''}`}><div className="newOrderLiveIcon"><BellRing/></div><div><strong>Novo pedido #{newOrderAlert.number}</strong><span>{newOrderAlert.customer} · {formatBRL(newOrderAlert.total)}</span></div><Link className="button smallButton" to={`/painel/pedidos?pedido=${encodeURIComponent(newOrderAlert.id)}`}>Ver pedido</Link></div>}
+    <div className="ownerStats"><StatCard label="Pedidos no caixa" value={String(stats.ordersToday)} helper="Desde o último fechamento" icon={ShoppingBag}/><StatCard label="Vendas no caixa" value={formatBRL(stats.salesToday)} helper={`Ticket médio ${formatBRL(averageTicket)}`} icon={DollarSign}/><StatCard label="Clientes" value={String(stats.customers)} helper="Clientes cadastrados" icon={Users}/><StatCard label="Produtos ativos" value={String(stats.products)} helper="Disponíveis na loja" icon={Box}/></div>
+    <div className="ownerDashboardGrid"><section className="panelCard"><div className="panelTitle"><div><h2>Pedidos do caixa atual</h2><p>Depois de fechar o caixa, os pedidos ficam somente em Relatórios.</p></div><Link to="/painel/pedidos">Ver todos</Link></div><DashboardOrdersTable rows={visibleOrders} highlightedIds={highlightedOrderIds}/><PaginationControls page={safePage} pageSize={pageSize} total={recentOrders.length} onPage={setPage} onPageSize={(size)=>{setPageSize(size);setPage(1)}}/></section><section className="panelCard"><div className="panelTitle"><div><h2>Ações rápidas</h2><p>Atalhos para tarefas frequentes.</p></div></div><div className="quickActions"><Link to="/painel/produtos"><Plus/><span><strong>Novo produto</strong><small>Cadastre item e preço</small></span></Link><Link to="/painel/entregas"><Bike/><span><strong>Taxas de entrega</strong><small>Configure bairros</small></span></Link><Link to="/painel/minha-loja"><Store/><span><strong>Editar loja</strong><small>Dados e aparência</small></span></Link><Link to="/painel/pagamentos"><CreditCard/><span><strong>Pagamentos</strong><small>Pix e formas aceitas</small></span></Link></div></section></div>
+    <section className="panelCard"><div className="panelTitle"><div><h2>Vendas dos últimos 7 dias</h2><p>Resumo financeiro. Os detalhes antigos ficam em Relatórios enquanto estiverem dentro da retenção.</p></div></div><div className="fakeChart">{weekSales.map((value,index)=><div key={index} title={formatBRL(value)} style={{height:`${Math.max(8,Math.round((value/maxWeek)*94))}%`}}></div>)}</div><div className="chartLabels"><span>6d</span><span>5d</span><span>4d</span><span>3d</span><span>2d</span><span>Ontem</span><span>Hoje</span></div></section>
   </div>
 }
 
-function RealOrdersTable({ rows, onStatus, onOpen }: { rows: any[]; onStatus: (id: string, status: string) => void; onOpen: (id: string) => void }) {
-  if (!rows.length) return <div style={{padding:'28px 4px',color:'#697386'}}>Nenhum pedido nesta categoria.</div>
-  return <div className="tableWrap"><table className="dataTable orderManagementTable"><thead><tr><th>Pedido</th><th>Cliente</th><th>Tipo</th><th>Total</th><th>Status</th><th>Atualizar</th><th></th></tr></thead><tbody>{rows.map((order) => {
-    const customer = Array.isArray(order.customer) ? order.customer[0] : order.customer
-    return <tr key={order.id}><td><strong>#{order.order_number || String(order.id).slice(0,6)}</strong><small>{new Date(order.created_at).toLocaleString('pt-BR')}</small></td><td>{customer?.name || 'Cliente'}<small>{customer?.whatsapp || ''}</small></td><td>{order.order_type === 'delivery' ? 'Delivery' : 'Retirada'}</td><td>{formatBRL(Number(order.total || 0))}</td><td><span className={`orderStatus ${order.status}`}>{statusLabel[order.status] || order.status}</span></td><td><select value={order.status} onChange={(e)=>onStatus(order.id,e.target.value)} style={{minWidth:150}}><option value="pending">Novo</option><option value="accepted">Aceito</option><option value="preparing">Preparando</option><option value="ready">Pronto</option>{order.order_type === 'delivery' && <option value="out_for_delivery">Saiu para entrega</option>}<option value="completed">Finalizado</option><option value="cancelled">Cancelado</option></select></td><td><button className="orderOpenButton" onClick={()=>onOpen(order.id)}>Ver pedido</button></td></tr>
-  })}</tbody></table></div>
+function DashboardOrdersTable({ rows, highlightedIds=[] }: { rows:any[]; highlightedIds?:string[] }) {
+  if(!rows.length) return <div style={{padding:'28px 4px',color:'#697386'}}>Nenhum pedido no caixa atual.</div>
+  return <div className="tableWrap"><table className="dataTable dashboardOrdersTable"><thead><tr><th>Pedido</th><th>Cliente</th><th>Tipo</th><th>Total</th><th>Status</th><th>Hora</th><th></th></tr></thead><tbody>{rows.map((order)=>{const customer=Array.isArray(order.customer)?order.customer[0]?.name:order.customer?.name;const isNew=highlightedIds.includes(String(order.id));return <tr key={order.id} className={isNew?'newOrderRowPulse':''}><td><strong>#{order.order_number||String(order.id).slice(0,6)}</strong>{isNew&&<span className="newOrderBadge">NOVO</span>}</td><td>{customer||'Cliente'}</td><td>{order.order_type==='delivery'?'Delivery':'Retirada'}</td><td>{formatBRL(Number(order.total||0))}</td><td><span className={`orderStatus ${order.status}`}>{statusLabel[order.status]||order.status}</span></td><td>{new Date(order.created_at).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}</td><td><Link className="orderOpenButton" to={`/painel/pedidos?pedido=${encodeURIComponent(order.id)}`}>Ver pedido</Link></td></tr>})}</tbody></table></div>
 }
 
-function OrderDetailsModal({ order, onClose, onStatus }: { order: any; onClose: () => void; onStatus: (id: string, status: string) => Promise<void> | void }) {
+function Orders() {
+  const location=useLocation()
+  const [filter,setFilter]=useState('todos')
+  const [rows,setRows]=useState<any[]>([])
+  const [loading,setLoading]=useState(true)
+  const [error,setError]=useState('')
+  const [selectedId,setSelectedId]=useState<string|null>(null)
+  const [pageSize,setPageSize]=useState(10)
+  const [page,setPage]=useState(1)
+
+  async function loadOrders(){
+    if(!supabase){setError('Supabase não configurado.');setLoading(false);return}
+    const {data:store,error:storeError}=await getOwnedStore()
+    if(storeError||!store){setError(storeError?.message||'Loja não encontrada.');setLoading(false);return}
+    try{await supabase.rpc('cleanup_my_expired_orders')}catch{}
+    const activeStart=operationalStart(store)
+    const result=await supabase.from('orders').select('id,order_number,order_type,payment_method,payment_status,paid_at,subtotal,delivery_fee,total,status,delivery_address,notes,age_confirmed,created_at,customer:customers(name,whatsapp)').eq('store_id',store.id).gte('created_at',activeStart.toISOString()).order('created_at',{ascending:false})
+    if(result.error)setError(result.error.message);else setRows(result.data||[])
+    setPage(1);setLoading(false)
+  }
+  useEffect(()=>{void loadOrders()},[])
+  useEffect(()=>{const orderId=new URLSearchParams(location.search).get('pedido');if(orderId)setSelectedId(orderId)},[location.search])
+  useEffect(()=>setPage(1),[filter,pageSize])
+  const filtered=filter==='todos'?rows:rows.filter((order)=>order.status===filter)
+  const totalPages=Math.max(1,Math.ceil(filtered.length/pageSize)); const safePage=Math.min(page,totalPages); const visible=filtered.slice((safePage-1)*pageSize,safePage*pageSize)
+  const selectedOrder=selectedId?rows.find((row)=>row.id===selectedId)||null:null
+  async function updateStatus(orderId:string,status:string){if(!supabase)return;const old=rows.find((row)=>row.id===orderId)?.status;setRows((current)=>current.map((row)=>row.id===orderId?{...row,status}:row));const{error:updateError}=await supabase.from('orders').update({status}).eq('id',orderId);if(updateError){setRows((current)=>current.map((row)=>row.id===orderId?{...row,status:old}:row));setError(updateError.message);return}if(status==='out_for_delivery')void sendOrderWhatsapp({orderId,event:'out_for_delivery'})}
+  async function markPixPaid(orderId:string){setError('');const result=await markManualPixPaid(orderId);if(result.error||!result.data){setError(result.error?.message||'Não foi possível confirmar o pagamento Pix.');return}const updated=result.data as any;setRows((current)=>current.map((row)=>row.id===orderId?{...row,payment_status:'paid',paid_at:updated.paid_at||new Date().toISOString(),status:updated.status||'preparing'}:row));void sendOrderWhatsapp({orderId,event:'payment_approved'})}
+  return <div className="ownerPage"><PageHeader title="Pedidos" description="Pedidos do caixa atual. Fechamentos anteriores ficam em Relatórios."/>{error&&<div className="infoAlert" style={{marginBottom:16}}>{error}</div>}<div className="filterTabs">{[['todos','Todos'],['pending','Novos'],['accepted','Aceitos'],['preparing','Preparando'],['out_for_delivery','Em entrega'],['ready','Prontos'],['completed','Finalizados'],['cancelled','Cancelados']].map(([value,label])=><button key={value} onClick={()=>setFilter(value)} className={filter===value?'active':''}>{label}</button>)}</div><section className="panelCard">{loading?<div style={{padding:'28px 4px',color:'#697386'}}>Carregando pedidos...</div>:<><RealOrdersTable rows={visible} onStatus={updateStatus} onOpen={setSelectedId}/><PaginationControls page={safePage} pageSize={pageSize} total={filtered.length} onPage={setPage} onPageSize={setPageSize}/></>}</section>{selectedOrder&&<OrderDetailsModal order={selectedOrder} onClose={()=>setSelectedId(null)} onStatus={updateStatus} onMarkPaid={markPixPaid}/>}</div>
+}
+
+function RealOrdersTable({ rows,onStatus,onOpen }:{rows:any[];onStatus:(id:string,status:string)=>void;onOpen:(id:string)=>void}){
+  if(!rows.length)return <div style={{padding:'28px 4px',color:'#697386'}}>Nenhum pedido nesta categoria.</div>
+  return <div className="tableWrap"><table className="dataTable orderManagementTable"><thead><tr><th>Pedido</th><th>Cliente</th><th>Tipo</th><th>Total</th><th>Status</th><th>Atualizar</th><th></th></tr></thead><tbody>{rows.map((order)=>{const customer=Array.isArray(order.customer)?order.customer[0]:order.customer;return <tr key={order.id}><td><strong>#{order.order_number||String(order.id).slice(0,6)}</strong><small>{new Date(order.created_at).toLocaleString('pt-BR')}</small></td><td>{customer?.name||'Cliente'}<small>{customer?.whatsapp||''}</small></td><td>{order.order_type==='delivery'?'Delivery':'Retirada'}</td><td>{formatBRL(Number(order.total||0))}</td><td><span className={`orderStatus ${order.status}`}>{statusLabel[order.status]||order.status}</span></td><td><select value={order.status} onChange={(e)=>onStatus(order.id,e.target.value)} style={{minWidth:150}}><option value="pending">Novo</option><option value="accepted">Aceito</option><option value="preparing">Preparando</option><option value="ready">Pronto</option>{order.order_type==='delivery'&&<option value="out_for_delivery">Saiu para entrega</option>}<option value="completed">Finalizado</option><option value="cancelled">Cancelado</option></select></td><td><button className="orderOpenButton" onClick={()=>onOpen(order.id)}>Ver pedido</button></td></tr>})}</tbody></table></div>
+}
+
+function OrderDetailsModal({ order, onClose, onStatus, onMarkPaid }: { order: any; onClose: () => void; onStatus: (id: string, status: string) => Promise<void> | void; onMarkPaid: (id: string) => Promise<void> | void }) {
   const [items, setItems] = useState<any[]>([])
   const [loadingItems, setLoadingItems] = useState(true)
   const [itemError, setItemError] = useState('')
+  const [messageTemplates, setMessageTemplates] = useState<any[]>([])
+  const [messageStoreName, setMessageStoreName] = useState('nossa loja')
   const customer = Array.isArray(order.customer) ? order.customer[0] : order.customer
 
   useEffect(() => {
@@ -271,16 +277,47 @@ function OrderDetailsModal({ order, onClose, onStatus }: { order: any; onClose: 
     return () => { mounted = false }
   }, [order.id])
 
+  useEffect(() => {
+    let mounted = true
+    async function loadTemplates() {
+      if (!supabase) return
+      const { data: ownedStore } = await getOwnedStore()
+      if (!ownedStore || !mounted) return
+      setMessageStoreName(ownedStore.name || 'nossa loja')
+      const { data } = await supabase.from('store_message_templates').select('*').eq('store_id', ownedStore.id).eq('active', true).order('sort_order').order('created_at')
+      if (mounted) setMessageTemplates(data || [])
+    }
+    loadTemplates()
+    return () => { mounted = false }
+  }, [order.id])
+
   const paymentLabel: Record<string,string> = { pix: 'Pix', cash: 'Dinheiro', card_on_delivery: 'Cartão na entrega' }
   const address = order.delivery_address || null
-  const addressText = address ? [address.street, address.number, address.neighborhood, address.cep, address.complement].filter(Boolean).join(', ') : ''
+  const addressText = address ? [address.street, address.number, address.neighborhood, address.city && address.state ? `${address.city}/${address.state}` : address.city || address.state, address.cep].filter(Boolean).join(', ') : ''
   const digits = String(customer?.whatsapp || '').replace(/\D/g,'')
   const whatsappNumber = digits.startsWith('55') ? digits : digits ? `55${digits}` : ''
   const nextStatus = getNextOrderStatus(order.status, order.order_type)
 
-  function openWhatsapp() {
+  function templateText(text: string) {
+    const orderId = order.order_number || String(order.id).slice(0,6)
+    const payment = paymentLabel[order.payment_method] || order.payment_method
+    const receipt = order.order_type === 'delivery' ? addressText : 'Retirada na loja'
+    const replacements: Record<string,string> = {
+      '{cliente}': customer?.name || 'Cliente',
+      '{pedido}': String(orderId),
+      '{loja}': messageStoreName,
+      '{total}': formatBRL(Number(order.total || 0)),
+      '{pagamento}': payment,
+      '{recebimento}': order.order_type === 'delivery' ? 'Delivery' : 'Retirada',
+      '{endereco}': receipt || 'Endereço não informado',
+    }
+    return Object.entries(replacements).reduce((value,[key,replacement]) => value.split(key).join(replacement), String(text || ''))
+  }
+
+  function openWhatsapp(messageText?: string) {
     if (!whatsappNumber) return
-    const message = encodeURIComponent(`Olá, ${customer?.name || ''}! Estamos falando sobre o seu pedido #${order.order_number || ''} no Pedevo.`)
+    const fallback = `Olá, ${customer?.name || ''}! Estamos falando sobre o seu pedido #${order.order_number || ''} no Pedevo.`
+    const message = encodeURIComponent(messageText ? templateText(messageText) : fallback)
     window.open(`https://wa.me/${whatsappNumber}?text=${message}`, '_blank', 'noopener,noreferrer')
   }
 
@@ -291,12 +328,16 @@ function OrderDetailsModal({ order, onClose, onStatus }: { order: any; onClose: 
       <div className="orderDetailTop">
         <div><span>Status</span><strong><span className={`orderStatus ${order.status}`}>{statusLabel[order.status] || order.status}</span></strong></div>
         <div><span>Total</span><strong>{formatBRL(Number(order.total || 0))}</strong></div>
-        <div><span>Pagamento</span><strong>{paymentLabel[order.payment_method] || order.payment_method}</strong></div>
+        <div><span>Pagamento</span><strong>{paymentLabel[order.payment_method] || order.payment_method}{order.payment_method === 'pix' ? ` · ${order.payment_status === 'paid' ? 'Pago' : order.payment_status === 'manual_pending' ? 'Aguardando comprovante' : order.payment_status === 'pending' ? 'Aguardando confirmação' : order.payment_status || ''}` : ''}</strong></div>
       </div>
 
-      <section className="orderDetailSection"><h3>Cliente</h3><div className="orderCustomerGrid"><div><span>Nome</span><strong>{customer?.name || 'Cliente'}</strong></div><div><span>WhatsApp</span><strong>{customer?.whatsapp || 'Não informado'}</strong></div></div>{whatsappNumber && <button className="button secondary smallButton" onClick={openWhatsapp}>Falar no WhatsApp</button>}</section>
+      <section className="orderDetailSection"><h3>Cliente</h3><div className="orderCustomerGrid"><div><span>Nome</span><strong>{customer?.name || 'Cliente'}</strong></div><div><span>WhatsApp</span><strong>{customer?.whatsapp || 'Não informado'}</strong></div></div>{whatsappNumber && <button className="button secondary smallButton" onClick={()=>openWhatsapp()}>Falar no WhatsApp</button>}</section>
 
-      {order.order_type === 'delivery' && <section className="orderDetailSection"><h3><MapPin size={17}/> Endereço de entrega</h3><p className="orderAddress">{addressText || 'Endereço não informado.'}</p></section>}
+      {order.payment_method === 'pix' && <section className="orderDetailSection manualPaymentOwnerSection"><h3><CreditCard size={17}/> Pagamento Pix</h3><div className="manualPaymentOwnerStatus"><div><span>Status</span><strong>{order.payment_status === 'paid' ? 'Pagamento confirmado' : order.payment_status === 'manual_pending' ? 'Aguardando comprovante' : order.payment_status === 'pending' ? 'Confirmação automática pendente' : order.payment_status || '—'}</strong></div>{order.payment_status === 'paid' && order.paid_at && <small>Confirmado em {new Date(order.paid_at).toLocaleString('pt-BR')}</small>}</div>{order.payment_status === 'manual_pending' && <button className="button paymentConfirmButton" onClick={()=>onMarkPaid(order.id)}><CheckCircle2 size={17}/> Marcar Pix como pago</button>}</section>}
+
+      {whatsappNumber && messageTemplates.length > 0 && <section className="orderDetailSection"><h3><MessageCircle size={17}/> Mensagens rápidas</h3><p className="orderMuted">Escolha uma mensagem. O WhatsApp abrirá com o texto preenchido para você revisar e enviar.</p><div className="quickMessageButtons">{messageTemplates.map((template)=><button key={template.id} className="miniButton quickMessageButton" onClick={()=>openWhatsapp(template.message)}><MessageCircle size={14}/>{template.name}</button>)}</div></section>}
+
+      {order.order_type === 'delivery' && <section className="orderDetailSection"><h3><MapPin size={17}/> Endereço de entrega</h3><p className="orderAddress">{addressText || 'Endereço não informado.'}</p>{address && <div className="deliveryAddressDetailGrid"><div><span>CEP</span><strong>{address.cep || '—'}</strong></div><div><span>Bairro</span><strong>{address.neighborhood || '—'}</strong></div><div><span>Cidade / UF</span><strong>{[address.city,address.state].filter(Boolean).join('/') || '—'}</strong></div><div><span>Complemento</span><strong>{address.complement || '—'}</strong></div><div className="wide"><span>Ponto de referência</span><strong>{address.reference || 'Não informado'}</strong></div></div>}</section>}
 
       <section className="orderDetailSection"><h3><Package size={17}/> Itens do pedido</h3>{loadingItems ? <p className="orderMuted">Carregando itens...</p> : itemError ? <p className="orderError">{itemError}</p> : <div className="orderItemsList">{items.map((item)=><div key={item.id}><div><strong>{item.quantity}x {item.product_name}</strong><small>{item.unit_label || 'unidade'} · {formatBRL(Number(item.unit_price || 0))} cada</small></div><b>{formatBRL(Number(item.total || 0))}</b></div>)}</div>}
         <div className="orderTotals"><div><span>Subtotal</span><strong>{formatBRL(Number(order.subtotal || 0))}</strong></div><div><span>Entrega</span><strong>{formatBRL(Number(order.delivery_fee || 0))}</strong></div><div className="grand"><span>Total</span><strong>{formatBRL(Number(order.total || 0))}</strong></div></div>
@@ -814,6 +855,7 @@ function Delivery() {
   const [defaultFee, setDefaultFee] = useState('0,00')
   const [modal, setModal] = useState(false)
   const [editingZone, setEditingZone] = useState<any>(null)
+  const [deletingZone, setDeletingZone] = useState<any>(null)
 
   async function loadDelivery() {
     if (!supabase) {
@@ -919,6 +961,20 @@ function Delivery() {
     }
   }
 
+  async function deleteZone() {
+    if (!supabase || !deletingZone) return
+    setSaving(true)
+    setError('')
+    const { error: deleteError } = await supabase.from('delivery_zones').delete().eq('id', deletingZone.id)
+    if (deleteError) setError(deleteError.message)
+    else {
+      setZones((current) => current.filter((zone) => zone.id !== deletingZone.id))
+      setSuccess(`Taxa de ${deletingZone.name} excluída. Esse bairro passará a usar a taxa padrão da cidade.`)
+      setDeletingZone(null)
+    }
+    setSaving(false)
+  }
+
   if (loading) return <div className="ownerPage"><PageHeader title="Entregas" description="Carregando configurações de entrega..."/></div>
 
   return <div className="ownerPage">
@@ -928,12 +984,12 @@ function Delivery() {
 
     <form className="panelCard" onSubmit={saveSettings}>
       <div className="settingsSection"><div><h2>Delivery</h2><p>Permitir que clientes façam pedidos para entrega.</p></div><label className="switch"><input checked={deliveryEnabled} type="checkbox" onChange={e=>setDeliveryEnabled(e.target.checked)}/><i></i></label></div>
-      <div className="formGrid two"><label>Pedido mínimo<input value={minOrder} onChange={(e)=>setMinOrder(e.target.value)} inputMode="decimal" placeholder="0,00"/><small>Valor mínimo dos produtos, antes da taxa de entrega.</small></label><label>Taxa padrão<input value={defaultFee} onChange={(e)=>setDefaultFee(e.target.value)} inputMode="decimal" placeholder="0,00"/><small>Usada somente quando não houver bairros cadastrados.</small></label></div>
+      <div className="serviceAreaOwnerNotice"><strong>Como a taxa de entrega funciona</strong><span>Defina uma taxa padrão para a cidade. Se um bairro tiver um valor diferente, cadastre esse bairro abaixo. Qualquer bairro sem taxa específica usa automaticamente a taxa padrão — assim nenhum pedido fica travado porque você esqueceu de cadastrar um bairro.</span></div><div className="formGrid two"><label>Pedido mínimo<input value={minOrder} onChange={(e)=>setMinOrder(e.target.value)} inputMode="decimal" placeholder="0,00"/><small>Valor mínimo dos produtos, antes da taxa de entrega.</small></label><label>Taxa padrão da cidade<input value={defaultFee} onChange={(e)=>setDefaultFee(e.target.value)} inputMode="decimal" placeholder="0,00"/><small>Aplicada automaticamente em qualquer bairro que não tenha uma taxa específica cadastrada.</small></label></div>
       <div className="deliverySettingsFooter"><div><strong>{deliveryEnabled ? 'Delivery ativo' : 'Delivery desativado'}</strong><span>{zones.filter((zone)=>zone.active).length} bairro(s) ativo(s)</span></div><button className="button" disabled={saving}>{saving ? 'Salvando...' : 'Salvar configurações'}</button></div>
     </form>
 
-    <section className="panelCard"><div className="panelTitle"><div><h2>Bairros e taxas</h2><p>O cliente escolhe o bairro no checkout e a taxa entra automaticamente no total.</p></div><button className="button secondary" onClick={openNewZone}><Plus size={17}/> Adicionar bairro</button></div>
-      {zones.length === 0 ? <div className="deliveryEmpty"><MapPin/><div><strong>Nenhum bairro cadastrado ainda</strong><span>Cadastre o primeiro bairro para cobrar a taxa certa automaticamente.</span></div></div> : <div className="neighborhoodList realZones">{zones.map((zone)=><div key={zone.id}><MapPin/><div><strong>{zone.name}</strong><small>{zone.eta_min_minutes != null ? `${zone.eta_min_minutes}${zone.eta_max_minutes != null ? `–${zone.eta_max_minutes}` : ''} min` : 'Prazo não informado'}</small></div><b>{formatBRL(Number(zone.fee || 0))}</b><label className="switch compactSwitch"><input type="checkbox" checked={Boolean(zone.active)} onChange={()=>toggleZone(zone)}/><i></i></label><button className="miniButton" onClick={()=>openEditZone(zone)}>Editar</button></div>)}</div>}
+    <section className="panelCard"><div className="panelTitle"><div><h2>Taxas específicas por bairro</h2><p>Cadastre somente os bairros que precisam cobrar um valor diferente da taxa padrão. O checkout identifica o bairro pelo CEP e calcula tudo automaticamente.</p></div><button className="button secondary" onClick={openNewZone}><Plus size={17}/> Adicionar bairro</button></div>
+      {zones.length === 0 ? <div className="deliveryEmpty"><MapPin/><div><strong>Nenhuma taxa específica cadastrada</strong><span>Todos os bairros atendidos estão usando a taxa padrão da cidade. Cadastre aqui apenas os bairros com valor diferente.</span></div></div> : <div className="neighborhoodList realZones">{zones.map((zone)=><div key={zone.id}><MapPin/><div><strong>{zone.name}</strong><small>{zone.eta_min_minutes != null ? `${zone.eta_min_minutes}${zone.eta_max_minutes != null ? `–${zone.eta_max_minutes}` : ''} min` : 'Prazo não informado'}</small></div><b>{formatBRL(Number(zone.fee || 0))}</b><label className="switch compactSwitch"><input type="checkbox" checked={Boolean(zone.active)} onChange={()=>toggleZone(zone)}/><i></i></label><div className="zoneActionButtons"><button className="miniButton" onClick={()=>openEditZone(zone)}><Pencil size={14}/> Editar</button><button className="miniButton dangerMiniButton" onClick={()=>setDeletingZone(zone)}><Trash2 size={14}/> Excluir</button></div></div>)}</div>}
     </section>
 
     {modal && <div className="modalBackdrop" onMouseDown={(event)=>{ if (event.target === event.currentTarget) setModal(false) }}><div className="modalCard deliveryZoneModal"><div className="modalTitle"><div><h2>{editingZone ? 'Editar bairro' : 'Adicionar bairro'}</h2><p>Defina o valor cobrado e o prazo aproximado.</p></div><button onClick={()=>setModal(false)}>×</button></div><form onSubmit={saveZone}>
@@ -942,6 +998,7 @@ function Delivery() {
       <div className="formGrid two"><label>Prazo mínimo (min)<input name="eta_min" type="number" min="0" defaultValue={editingZone?.eta_min_minutes ?? ''} placeholder="25"/></label><label>Prazo máximo (min)<input name="eta_max" type="number" min="0" defaultValue={editingZone?.eta_max_minutes ?? ''} placeholder="40"/></label></div>
       <button className="button full large" disabled={saving}>{saving ? 'Salvando...' : editingZone ? 'Salvar bairro' : 'Adicionar bairro'}</button>
     </form></div></div>}
+    {deletingZone && <div className="modalBackdrop"><div className="modalCard confirmDeleteModal"><div className="deleteIcon"><Trash2 size={26}/></div><h2>Excluir taxa de “{deletingZone.name}”?</h2><p>O bairro não será bloqueado. Depois da exclusão, ele passará a usar automaticamente a <strong>taxa padrão da cidade</strong>.</p><div className="confirmDeleteActions"><button className="button secondary" onClick={()=>setDeletingZone(null)} disabled={saving}>Cancelar</button><button className="button dangerButton" onClick={deleteZone} disabled={saving}>{saving ? 'Excluindo...' : 'Excluir taxa'}</button></div></div></div>}
   </div>
 }
 
@@ -955,6 +1012,9 @@ function Payments() {
   const [cardEnabled, setCardEnabled] = useState(true)
   const [success, setSuccess] = useState('')
   const [error, setError] = useState('')
+  const [pixAutoEnabled, setPixAutoEnabled] = useState(false)
+  const [mercadoPagoToken, setMercadoPagoToken] = useState('')
+  const [savingGateway, setSavingGateway] = useState(false)
 
   useEffect(() => {
     let mounted = true
@@ -969,6 +1029,7 @@ function Payments() {
       setStore(data)
       setPixEnabled(Boolean(data.pix_enabled))
       setPixKey(data.pix_key || '')
+      setPixAutoEnabled(Boolean(data.pix_auto_enabled))
       setCashEnabled(Boolean(data.cash_enabled))
       setCardEnabled(Boolean(data.card_on_delivery_enabled))
       setLoading(false)
@@ -986,14 +1047,15 @@ function Payments() {
       setError('Ative pelo menos uma forma de pagamento.')
       return
     }
-    if (pixEnabled && !pixKey.trim()) {
-      setError('Informe a chave Pix ou desative o Pix.')
+    if (pixEnabled && !pixAutoEnabled && !pixKey.trim()) {
+      setError('Informe a chave Pix para usar o modo manual ou conecte o Mercado Pago.')
       return
     }
     setSaving(true)
     const { data, error: updateError } = await supabase.from('stores').update({
       pix_enabled: pixEnabled,
-      pix_key: pixEnabled ? pixKey.trim() : null,
+      pix_key: pixEnabled ? (pixKey.trim() || null) : null,
+      pix_auto_enabled: pixEnabled ? pixAutoEnabled : false,
       cash_enabled: cashEnabled,
       card_on_delivery_enabled: cardEnabled,
     }).eq('id', store.id).select('*').single()
@@ -1005,6 +1067,43 @@ function Payments() {
     setSaving(false)
   }
 
+  async function saveAutomaticPix() {
+    if (!store) return
+    setError('')
+    setSuccess('')
+    if (!mercadoPagoToken.trim()) {
+      setError('Cole o Access Token de produção do Mercado Pago para ativar o Pix automático.')
+      return
+    }
+    setSavingGateway(true)
+    const result = await saveMercadoPagoToken(store.id, mercadoPagoToken.trim())
+    if (result.error) setError(result.error.message || 'Não foi possível conectar o Mercado Pago.')
+    else {
+      setPixAutoEnabled(true)
+      setMercadoPagoToken('')
+      setSuccess('Mercado Pago conectado. O Pix automático está ativo para esta loja.')
+    }
+    setSavingGateway(false)
+  }
+
+  async function useManualPix() {
+    if (!supabase || !store) return
+    setError('')
+    setSuccess('')
+    if (!pixKey.trim()) {
+      setError('Informe primeiro a chave Pix que receberá os pagamentos manuais.')
+      return
+    }
+    setSavingGateway(true)
+    const { error: updateError } = await supabase.from('stores').update({ pix_auto_enabled: false, pix_key: pixKey.trim() }).eq('id', store.id)
+    if (updateError) setError(updateError.message)
+    else {
+      setPixAutoEnabled(false)
+      setSuccess('Pix manual ativado. O Pedevo gerará QR Code e Pix Copia e Cola usando a chave e o valor de cada pedido.')
+    }
+    setSavingGateway(false)
+  }
+
   if (loading) return <div className="ownerPage"><PageHeader title="Pagamentos" description="Carregando formas de pagamento..."/></div>
 
   return <div className="ownerPage">
@@ -1013,8 +1112,9 @@ function Payments() {
     {success && <div className="successAlert" style={{marginBottom:16}}>{success}</div>}
     <form onSubmit={savePayments}>
       <section className="panelCard">
-        <div className="paymentSetting"><span>◈</span><div><strong>Pix</strong><p>O cliente verá a chave no checkout para copiar e fazer o pagamento.</p></div><label className="switch"><input type="checkbox" checked={pixEnabled} onChange={(e)=>setPixEnabled(e.target.checked)}/><i></i></label></div>
-        {pixEnabled && <label>Chave Pix<input value={pixKey} onChange={(e)=>setPixKey(e.target.value)} placeholder="CPF, CNPJ, e-mail, telefone ou chave aleatória"/><small>Cadastre somente a chave pública de recebimento. Para privacidade, prefira chave aleatória, CNPJ ou contato comercial; nunca coloque senha ou token bancário.</small></label>}
+        <div className="paymentSetting"><span>◈</span><div><strong>Pix</strong><p>Escolha entre cobrança manual pela sua chave ou confirmação automática pelo Mercado Pago.</p></div><label className="switch"><input type="checkbox" checked={pixEnabled} onChange={(e)=>setPixEnabled(e.target.checked)}/><i></i></label></div>
+        {pixEnabled && <div className="pixModeGrid"><button type="button" className={!pixAutoEnabled ? 'pixModeCard active' : 'pixModeCard'} onClick={useManualPix}><span>🔑</span><div><strong>Pix manual</strong><small>QR Code + Copia e Cola gerados pela chave da loja. O cliente envia comprovante e você confirma o pagamento.</small></div>{!pixAutoEnabled && <b>Em uso</b>}</button><div className={pixAutoEnabled ? 'pixModeCard active static' : 'pixModeCard static'}><span>⚡</span><div><strong>Pix automático</strong><small>Mercado Pago confirma o pagamento por webhook e atualiza o pedido automaticamente.</small></div>{pixAutoEnabled && <b>Em uso</b>}</div></div>}
+        {pixEnabled && !pixAutoEnabled && <label>Chave Pix do modo manual<input value={pixKey} onChange={(e)=>setPixKey(e.target.value)} placeholder="CPF, CNPJ, e-mail, telefone ou chave aleatória"/><small>O Pedevo usa essa chave + o valor do pedido para gerar QR Code e Pix Copia e Cola. Informe a chave exatamente como está cadastrada no banco. O prazo de 10 minutos é do pedido no Pedevo; uma cobrança Pix estática não pode ser invalidada pelo banco automaticamente.</small></label>}
       </section>
       <section className="panelCard">
         <div className="paymentSetting"><span>💵</span><div><strong>Dinheiro</strong><p>O cliente poderá informar no checkout o valor para troco.</p></div><label className="switch"><input type="checkbox" checked={cashEnabled} onChange={(e)=>setCashEnabled(e.target.checked)}/><i></i></label></div>
@@ -1022,235 +1122,83 @@ function Payments() {
       </section>
       <div className="paymentSaveBar"><div><strong>{[pixEnabled, cashEnabled, cardEnabled].filter(Boolean).length} forma(s) ativa(s)</strong><span>O checkout será atualizado automaticamente.</span></div><button className="button" disabled={saving}>{saving ? 'Salvando...' : 'Salvar pagamentos'}</button></div>
     </form>
-    <div className="infoAlert">Nesta fase, o Pix é confirmado manualmente pelo lojista e cartão é pago na maquininha. Pagamento online automático será adicionado depois com backend seguro.</div>
+    <section className="panelCard autoPixOwnerCard">
+      <div className="panelTitle"><div><h2>Automação Pix — Mercado Pago</h2><p>Opcional. Use se quiser confirmação automática sem conferir comprovante.</p></div><span className={pixAutoEnabled ? 'gatewayBadge connected' : 'gatewayBadge'}>{pixAutoEnabled ? 'Automático ativo' : 'Modo manual'}</span></div>
+      <div className="gatewayExplanation"><strong>Automático</strong><span>Ao conectar a conta Mercado Pago que receberá as vendas, cada pedido gera um Pix único. O webhook confirma o pagamento e o Pedevo muda o pedido para “Preparando”. Se preferir não conectar nada, continue no Pix manual.</span></div>
+      <label>Access Token de produção do Mercado Pago<input type="password" value={mercadoPagoToken} onChange={(e)=>setMercadoPagoToken(e.target.value)} placeholder="APP_USR-..." autoComplete="off"/><small>Esse token vai para uma Edge Function segura no Supabase e não deve ser enviado para o GitHub.</small></label>
+      <div className="gatewayActions"><button type="button" className="button" disabled={savingGateway} onClick={saveAutomaticPix}>{savingGateway ? 'Conectando...' : pixAutoEnabled ? 'Atualizar conexão Mercado Pago' : 'Conectar e usar Pix automático'}</button>{pixAutoEnabled && <button type="button" className="button secondary" disabled={savingGateway} onClick={useManualPix}>Voltar para Pix manual</button>}</div>
+    </section>
+    <div className="infoAlert">No modo manual, o cliente vê QR Code + Pix Copia e Cola, tem 10 minutos para pagar e pode abrir o WhatsApp para enviar o comprovante. Você confirma em <strong>Pedidos → Marcar Pix como pago</strong>. No modo automático, o Mercado Pago confirma sozinho.</div>
   </div>
 }
 
 function Reports() {
-  type Period = 'today' | '7d' | '30d' | 'month'
-  const [period, setPeriod] = useState<Period>('30d')
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-  const [orders, setOrders] = useState<any[]>([])
-  const [items, setItems] = useState<any[]>([])
-  const [newCustomers, setNewCustomers] = useState(0)
-  const [rangeLabel, setRangeLabel] = useState('')
-  const [rangeStart, setRangeStart] = useState<Date>(new Date())
+  type Period = 'today' | '24h' | '48h'
+  const [period,setPeriod]=useState<Period>('48h')
+  const [loading,setLoading]=useState(true)
+  const [error,setError]=useState('')
+  const [success,setSuccess]=useState('')
+  const [orders,setOrders]=useState<any[]>([])
+  const [items,setItems]=useState<any[]>([])
+  const [closings,setClosings]=useState<any[]>([])
+  const [newCustomers,setNewCustomers]=useState(0)
+  const [rangeLabel,setRangeLabel]=useState('')
+  const [rangeStart,setRangeStart]=useState<Date>(new Date())
+  const [store,setStore]=useState<any>(null)
+  const [retentionHours,setRetentionHours]=useState<24|48>(48)
+  const [savingRetention,setSavingRetention]=useState(false)
+  const [orderPageSize,setOrderPageSize]=useState(10)
+  const [orderPage,setOrderPage]=useState(1)
 
-  function getRange(selected: Period) {
-    const now = new Date()
-    const start = new Date(now)
-    if (selected === 'today') start.setHours(0, 0, 0, 0)
-    if (selected === '7d') { start.setDate(start.getDate() - 6); start.setHours(0, 0, 0, 0) }
-    if (selected === '30d') { start.setDate(start.getDate() - 29); start.setHours(0, 0, 0, 0) }
-    if (selected === 'month') { start.setDate(1); start.setHours(0, 0, 0, 0) }
-    const label = selected === 'today' ? 'Hoje' : selected === '7d' ? 'Últimos 7 dias' : selected === '30d' ? 'Últimos 30 dias' : 'Este mês'
-    return { start, end: now, label }
-  }
+  function getRange(selected:Period){const now=new Date();const start=new Date(now);if(selected==='today')start.setHours(0,0,0,0);if(selected==='24h')start.setHours(start.getHours()-24);if(selected==='48h')start.setHours(start.getHours()-48);const label=selected==='today'?'Hoje':selected==='24h'?'Últimas 24 horas':'Últimas 48 horas';return{start,end:now,label}}
 
-  useEffect(() => {
-    let mounted = true
-    async function loadReports() {
-      if (!supabase) {
-        setError('Supabase não configurado.')
-        setLoading(false)
-        return
-      }
-      setLoading(true)
-      setError('')
-      const { data: store, error: storeError } = await getOwnedStore()
-      if (!mounted) return
-      if (storeError || !store) {
-        setError(storeError?.message || 'Loja não encontrada.')
-        setLoading(false)
-        return
-      }
-
-      const { start, end, label } = getRange(period)
-      setRangeStart(start)
-      setRangeLabel(label)
-
-      const [ordersResult, customersResult] = await Promise.all([
-        supabase
-          .from('orders')
-          .select('id,order_number,customer_id,order_type,payment_method,status,subtotal,delivery_fee,total,created_at')
-          .eq('store_id', store.id)
-          .gte('created_at', start.toISOString())
-          .lte('created_at', end.toISOString())
-          .order('created_at', { ascending: true }),
-        supabase
-          .from('customers')
-          .select('id', { count: 'exact', head: true })
-          .eq('store_id', store.id)
-          .gte('created_at', start.toISOString())
-          .lte('created_at', end.toISOString()),
-      ])
-
-      if (!mounted) return
-      if (ordersResult.error) {
-        setError(ordersResult.error.message)
-        setLoading(false)
-        return
-      }
-
-      const loadedOrders = ordersResult.data || []
-      let loadedItems: any[] = []
-      if (loadedOrders.length) {
-        const itemResult = await supabase
-          .from('order_items')
-          .select('order_id,product_id,product_name,quantity,total')
-          .in('order_id', loadedOrders.map((order:any) => order.id))
-        if (!mounted) return
-        if (itemResult.error) setError(itemResult.error.message)
-        else loadedItems = itemResult.data || []
-      }
-
-      setOrders(loadedOrders)
-      setItems(loadedItems)
-      setNewCustomers(customersResult.count || 0)
-      setLoading(false)
-    }
-    loadReports()
-    return () => { mounted = false }
-  }, [period])
-
-  const validOrders = useMemo(() => orders.filter((order:any) => order.status !== 'cancelled'), [orders])
-  const cancelledOrders = useMemo(() => orders.filter((order:any) => order.status === 'cancelled'), [orders])
-  const completedOrders = useMemo(() => orders.filter((order:any) => order.status === 'completed'), [orders])
-  const sales = validOrders.reduce((sum:number, order:any) => sum + Number(order.total || 0), 0)
-  const averageTicket = validOrders.length ? sales / validOrders.length : 0
-  const finishedCount = completedOrders.length + cancelledOrders.length
-  const completionRate = finishedCount ? (completedOrders.length / finishedCount) * 100 : 0
-
-  const dailySales = useMemo(() => {
-    const start = new Date(rangeStart)
-    const end = new Date()
-    const result: Array<{key:string; label:string; total:number}> = []
-    const cursor = new Date(start)
-    while (cursor <= end && result.length < 45) {
-      result.push({
-        key: cursor.toLocaleDateString('pt-BR'),
-        label: cursor.toLocaleDateString('pt-BR', { day:'2-digit', month:'2-digit' }),
-        total: 0,
-      })
-      cursor.setDate(cursor.getDate() + 1)
-    }
-    validOrders.forEach((order:any) => {
-      const key = new Date(order.created_at).toLocaleDateString('pt-BR')
-      const bucket = result.find((entry) => entry.key === key)
-      if (bucket) bucket.total += Number(order.total || 0)
-    })
-    return result
-  }, [validOrders, rangeStart])
-
-  const topProducts = useMemo(() => {
-    const validOrderIds = new Set(validOrders.map((order:any) => order.id))
-    const grouped = new Map<string, {name:string; quantity:number; revenue:number}>()
-    items.forEach((item:any) => {
-      if (!validOrderIds.has(item.order_id)) return
-      const key = item.product_id || item.product_name
-      const current = grouped.get(key) || { name: item.product_name || 'Produto', quantity: 0, revenue: 0 }
-      current.quantity += Number(item.quantity || 0)
-      current.revenue += Number(item.total || 0)
-      grouped.set(key, current)
-    })
-    return Array.from(grouped.values()).sort((a,b) => b.quantity - a.quantity || b.revenue - a.revenue).slice(0,5)
-  }, [items, validOrders])
-
-  const paymentBreakdown = useMemo(() => {
-    const labels: Record<string,string> = { pix:'Pix', cash:'Dinheiro', card_on_delivery:'Cartão' }
-    const grouped = new Map<string, {method:string; count:number; total:number}>()
-    validOrders.forEach((order:any) => {
-      const key = order.payment_method || 'outro'
-      const current = grouped.get(key) || { method: labels[key] || key, count: 0, total: 0 }
-      current.count += 1
-      current.total += Number(order.total || 0)
-      grouped.set(key, current)
-    })
-    return Array.from(grouped.values()).sort((a,b) => b.total - a.total)
-  }, [validOrders])
-
-  const serviceBreakdown = useMemo(() => {
-    const delivery = validOrders.filter((order:any) => order.order_type === 'delivery')
-    const pickup = validOrders.filter((order:any) => order.order_type === 'pickup')
-    return [
-      { label:'Delivery', count:delivery.length, total:delivery.reduce((s:number,o:any)=>s+Number(o.total||0),0), icon:'🛵' },
-      { label:'Retirada', count:pickup.length, total:pickup.reduce((s:number,o:any)=>s+Number(o.total||0),0), icon:'🏪' },
-    ]
-  }, [validOrders])
-
-  function exportCsv() {
-    const header = ['Pedido','Data','Tipo','Pagamento','Status','Subtotal','Entrega','Total']
-    const paymentLabels: Record<string,string> = { pix:'Pix', cash:'Dinheiro', card_on_delivery:'Cartão' }
-    const rows = orders.map((order:any) => [
-      order.order_number || order.id,
-      new Date(order.created_at).toLocaleString('pt-BR'),
-      order.order_type === 'delivery' ? 'Delivery' : 'Retirada',
-      paymentLabels[order.payment_method] || order.payment_method,
-      statusLabel[order.status] || order.status,
-      Number(order.subtotal || 0).toFixed(2).replace('.',','),
-      Number(order.delivery_fee || 0).toFixed(2).replace('.',','),
-      Number(order.total || 0).toFixed(2).replace('.',','),
+  async function loadReports(){
+    if(!supabase){setError('Supabase não configurado.');setLoading(false);return}
+    setLoading(true);setError('')
+    const {data:ownedStore,error:storeError}=await getOwnedStore()
+    if(storeError||!ownedStore){setError(storeError?.message||'Loja não encontrada.');setLoading(false);return}
+    setStore(ownedStore);setRetentionHours(Number(ownedStore.order_retention_hours)===24?24:48)
+    try{await supabase.rpc('cleanup_my_expired_orders')}catch{}
+    const {start,end,label}=getRange(period);setRangeStart(start);setRangeLabel(label)
+    const [ordersResult,customersResult,closingsResult]=await Promise.all([
+      supabase.from('orders').select('id,order_number,customer_id,order_type,payment_method,status,subtotal,delivery_fee,total,created_at,customer:customers(name,whatsapp)').eq('store_id',ownedStore.id).gte('created_at',start.toISOString()).lte('created_at',end.toISOString()).order('created_at',{ascending:false}),
+      supabase.from('customers').select('id',{count:'exact',head:true}).eq('store_id',ownedStore.id).gte('created_at',start.toISOString()).lte('created_at',end.toISOString()),
+      supabase.from('cash_closings').select('*').eq('store_id',ownedStore.id).order('closed_at',{ascending:false}).limit(30),
     ])
-    const quote = (value:any) => `"${String(value ?? '').replace(/"/g,'""')}"`
-    const csv = [header, ...rows].map((row) => row.map(quote).join(';')).join('\n')
-    const blob = new Blob([`\uFEFF${csv}`], { type:'text/csv;charset=utf-8;' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `pedevo-relatorio-${new Date().toISOString().slice(0,10)}.csv`
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    URL.revokeObjectURL(url)
+    if(ordersResult.error){setError(ordersResult.error.message);setLoading(false);return}
+    const loadedOrders=ordersResult.data||[];let loadedItems:any[]=[]
+    if(loadedOrders.length){const itemResult=await supabase.from('order_items').select('order_id,product_id,product_name,quantity,total').in('order_id',loadedOrders.map((order:any)=>order.id));if(itemResult.error)setError(itemResult.error.message);else loadedItems=itemResult.data||[]}
+    setOrders(loadedOrders);setItems(loadedItems);setClosings(closingsResult.data||[]);setNewCustomers(customersResult.count||0);setOrderPage(1);setLoading(false)
   }
+  useEffect(()=>{void loadReports()},[period])
 
-  const maxDaily = Math.max(...dailySales.map((entry) => entry.total), 1)
+  async function saveRetention(hours:24|48){if(!supabase||!store?.id)return;setSavingRetention(true);setError('');setSuccess('');const{data,error:updateError}=await supabase.from('stores').update({order_retention_hours:hours}).eq('id',store.id).select('*').single();if(updateError)setError(updateError.message);else{setStore(data);setRetentionHours(hours);setSuccess(`Retenção alterada para ${hours} horas. Os pedidos fechados serão excluídos automaticamente após esse prazo.`)}setSavingRetention(false)}
 
-  return <div className="ownerPage">
-    <PageHeader title="Relatórios" description="Acompanhe as vendas reais da sua loja." action={<button type="button" className="button secondary" onClick={exportCsv} disabled={!orders.length}>Exportar CSV</button>}/>
-    <div className="reportToolbar">
-      <div><strong>Período</strong><span>{rangeLabel}</span></div>
-      <div className="reportPeriodTabs">
-        {([['today','Hoje'],['7d','7 dias'],['30d','30 dias'],['month','Este mês']] as Array<[Period,string]>).map(([value,label]) => <button type="button" key={value} className={period===value?'active':''} onClick={()=>setPeriod(value)}>{label}</button>)}
-      </div>
-    </div>
-
-    {error && <div className="infoAlert" style={{marginBottom:16}}>{error}</div>}
-    {loading ? <section className="panelCard"><div style={{padding:'28px 4px',color:'#697386'}}>Carregando relatórios reais...</div></section> : <>
-      <div className="ownerStats reportStats">
-        <StatCard label="Faturamento" value={formatBRL(sales)} helper={`${validOrders.length} pedido(s) válido(s)`} icon={DollarSign}/>
-        <StatCard label="Pedidos" value={String(orders.length)} helper={`Ticket médio ${formatBRL(averageTicket)}`} icon={ShoppingBag}/>
-        <StatCard label="Novos clientes" value={String(newCustomers)} helper={`No período: ${rangeLabel.toLowerCase()}`} icon={Users}/>
-        <StatCard label="Taxa de conclusão" value={`${completionRate.toFixed(1).replace('.',',')}%`} helper={`${cancelledOrders.length} cancelado(s)`} icon={CheckCircle2}/>
-      </div>
-
-      <section className="panelCard reportChartCard">
-        <div className="panelTitle"><div><h2>Vendas por dia</h2><p>Pedidos cancelados não entram no faturamento.</p></div><strong>{formatBRL(sales)}</strong></div>
-        {dailySales.some((entry)=>entry.total>0) ? <>
-          <div className="reportChart" style={{gridTemplateColumns:`repeat(${dailySales.length}, minmax(7px, 1fr))`}}>{dailySales.map((entry) => <div className="reportBarColumn" key={entry.key} title={`${entry.label}: ${formatBRL(entry.total)}`}><div className="reportBar" style={{height:`${Math.max(entry.total ? 8 : 2, Math.round((entry.total/maxDaily)*100))}%`}}></div></div>)}</div>
-          <div className="reportChartRange"><span>{dailySales[0]?.label}</span><span>{dailySales.length > 2 ? dailySales[Math.floor(dailySales.length/2)]?.label : ''}</span><span>{dailySales[dailySales.length-1]?.label}</span></div>
-        </> : <div className="reportEmpty">Ainda não há vendas neste período.</div>}
-      </section>
-
-      <div className="reportGrid">
-        <section className="panelCard">
-          <div className="panelTitle"><div><h2>Produtos mais vendidos</h2><p>Ranking por quantidade vendida.</p></div></div>
-          {topProducts.length ? <div className="rankList realRankList">{topProducts.map((product,index)=><div key={`${product.name}-${index}`}><span>{index+1}</span><b>📦</b><div><strong>{product.name}</strong><small>{product.quantity} unidade(s)</small></div><em>{formatBRL(product.revenue)}</em></div>)}</div> : <div className="reportEmpty">Nenhum produto vendido no período.</div>}
-        </section>
-
-        <section className="panelCard">
-          <div className="panelTitle"><div><h2>Formas de pagamento</h2><p>Como os clientes pagaram.</p></div></div>
-          {paymentBreakdown.length ? <div className="reportBreakdownList">{paymentBreakdown.map((entry)=><div key={entry.method}><span className="reportBreakdownIcon"><CreditCard size={18}/></span><div><strong>{entry.method}</strong><small>{entry.count} pedido(s)</small></div><em>{formatBRL(entry.total)}</em></div>)}</div> : <div className="reportEmpty">Sem pagamentos neste período.</div>}
-        </section>
-      </div>
-
-      <section className="panelCard">
-        <div className="panelTitle"><div><h2>Delivery x retirada</h2><p>Compare os canais usados pelos clientes.</p></div></div>
-        <div className="serviceReportGrid">{serviceBreakdown.map((entry)=><div key={entry.label}><span>{entry.icon}</span><div><strong>{entry.label}</strong><small>{entry.count} pedido(s)</small></div><em>{formatBRL(entry.total)}</em></div>)}</div>
-      </section>
+  const validOrders=useMemo(()=>orders.filter((order:any)=>order.status!=='cancelled'),[orders]);const cancelledOrders=useMemo(()=>orders.filter((order:any)=>order.status==='cancelled'),[orders]);const completedOrders=useMemo(()=>orders.filter((order:any)=>order.status==='completed'),[orders]);const sales=validOrders.reduce((sum:number,order:any)=>sum+Number(order.total||0),0);const averageTicket=validOrders.length?sales/validOrders.length:0;const finishedCount=completedOrders.length+cancelledOrders.length;const completionRate=finishedCount?(completedOrders.length/finishedCount)*100:0
+  const dailySales=useMemo(()=>{const start=new Date(rangeStart);const end=new Date();const result:Array<{key:string;label:string;total:number}>=[];const cursor=new Date(start);while(cursor<=end&&result.length<4){result.push({key:cursor.toLocaleDateString('pt-BR'),label:cursor.toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'}),total:0});cursor.setDate(cursor.getDate()+1)}validOrders.forEach((order:any)=>{const key=new Date(order.created_at).toLocaleDateString('pt-BR');const bucket=result.find((entry)=>entry.key===key);if(bucket)bucket.total+=Number(order.total||0)});return result},[validOrders,rangeStart])
+  const topProducts=useMemo(()=>{const validIds=new Set(validOrders.map((o:any)=>o.id));const grouped=new Map<string,{name:string;quantity:number;revenue:number}>();items.forEach((item:any)=>{if(!validIds.has(item.order_id))return;const key=item.product_id||item.product_name;const current=grouped.get(key)||{name:item.product_name||'Produto',quantity:0,revenue:0};current.quantity+=Number(item.quantity||0);current.revenue+=Number(item.total||0);grouped.set(key,current)});return Array.from(grouped.values()).sort((a,b)=>b.quantity-a.quantity||b.revenue-a.revenue).slice(0,5)},[items,validOrders])
+  const paymentBreakdown=useMemo(()=>{const labels:Record<string,string>={pix:'Pix',cash:'Dinheiro',card_on_delivery:'Cartão'};const grouped=new Map<string,{method:string;count:number;total:number}>();validOrders.forEach((order:any)=>{const key=order.payment_method||'outro';const current=grouped.get(key)||{method:labels[key]||key,count:0,total:0};current.count++;current.total+=Number(order.total||0);grouped.set(key,current)});return Array.from(grouped.values()).sort((a,b)=>b.total-a.total)},[validOrders])
+  const serviceBreakdown=useMemo(()=>{const delivery=validOrders.filter((o:any)=>o.order_type==='delivery');const pickup=validOrders.filter((o:any)=>o.order_type==='pickup');return[{label:'Delivery',count:delivery.length,total:delivery.reduce((s:number,o:any)=>s+Number(o.total||0),0),icon:'🛵'},{label:'Retirada',count:pickup.length,total:pickup.reduce((s:number,o:any)=>s+Number(o.total||0),0),icon:'🏪'}]},[validOrders])
+  function exportCsv(){const header=['Pedido','Data','Cliente','Tipo','Pagamento','Status','Subtotal','Entrega','Total'];const labels:Record<string,string>={pix:'Pix',cash:'Dinheiro',card_on_delivery:'Cartão'};const rows=orders.map((order:any)=>{const customer=Array.isArray(order.customer)?order.customer[0]:order.customer;return[order.order_number||order.id,new Date(order.created_at).toLocaleString('pt-BR'),customer?.name||'',order.order_type==='delivery'?'Delivery':'Retirada',labels[order.payment_method]||order.payment_method,statusLabel[order.status]||order.status,Number(order.subtotal||0).toFixed(2).replace('.',','),Number(order.delivery_fee||0).toFixed(2).replace('.',','),Number(order.total||0).toFixed(2).replace('.',',')]});const quote=(value:any)=>`"${String(value??'').replace(/"/g,'""')}"`;const csv=[header,...rows].map((row)=>row.map(quote).join(';')).join('\n');const blob=new Blob([`\uFEFF${csv}`],{type:'text/csv;charset=utf-8;'});const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download=`pedevo-relatorio-${new Date().toISOString().slice(0,10)}.csv`;document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(url)}
+  const maxDaily=Math.max(...dailySales.map((entry)=>entry.total),1);const totalOrderPages=Math.max(1,Math.ceil(orders.length/orderPageSize));const safeOrderPage=Math.min(orderPage,totalOrderPages);const visibleOrders=orders.slice((safeOrderPage-1)*orderPageSize,safeOrderPage*orderPageSize)
+  return <div className="ownerPage"><PageHeader title="Relatórios" description="Consulte pedidos fechados e resumos do caixa enquanto estiverem disponíveis." action={<button type="button" className="button secondary" onClick={exportCsv} disabled={!orders.length}>Exportar CSV</button>}/>
+    <section className="retentionNotice"><AlertTriangle/><div><strong>Retenção dos pedidos detalhados: {retentionHours} horas</strong><span>Após fechar o caixa, os pedidos continuam aqui por {retentionHours} horas e depois são apagados automaticamente. Os resumos de fechamento permanecem salvos.</span></div><div className="retentionChoice"><button type="button" disabled={savingRetention} className={retentionHours===24?'active':''} onClick={()=>saveRetention(24)}>24 horas</button><button type="button" disabled={savingRetention} className={retentionHours===48?'active':''} onClick={()=>saveRetention(48)}>48 horas</button></div></section>
+    {success&&<div className="successAlert">{success}</div>}{error&&<div className="infoAlert">{error}</div>}
+    <div className="reportToolbar"><div><strong>Período</strong><span>{rangeLabel}</span></div><div className="reportPeriodTabs">{([['today','Hoje'],['24h','24 horas'],['48h','48 horas']] as Array<[Period,string]>).map(([value,label])=><button type="button" key={value} className={period===value?'active':''} onClick={()=>setPeriod(value)}>{label}</button>)}</div></div>
+    {loading?<section className="panelCard"><div style={{padding:'28px 4px',color:'#697386'}}>Carregando relatórios...</div></section>:<>
+      <div className="ownerStats reportStats"><StatCard label="Faturamento" value={formatBRL(sales)} helper={`${validOrders.length} pedido(s) válido(s)`} icon={DollarSign}/><StatCard label="Pedidos" value={String(orders.length)} helper={`Ticket médio ${formatBRL(averageTicket)}`} icon={ShoppingBag}/><StatCard label="Novos clientes" value={String(newCustomers)} helper={rangeLabel} icon={Users}/><StatCard label="Taxa de conclusão" value={`${completionRate.toFixed(1).replace('.',',')}%`} helper={`${cancelledOrders.length} cancelado(s)`} icon={CheckCircle2}/></div>
+      <section className="panelCard"><div className="panelTitle"><div><h2>Pedidos disponíveis</h2><p>Aqui aparecem os pedidos do caixa atual e dos fechamentos recentes, até o prazo de retenção.</p></div></div><ReportOrdersTable rows={visibleOrders}/><PaginationControls page={safeOrderPage} pageSize={orderPageSize} total={orders.length} onPage={setOrderPage} onPageSize={(size)=>{setOrderPageSize(size);setOrderPage(1)}}/></section>
+      <section className="panelCard cashClosingHistory"><div className="panelTitle"><div><h2>Histórico de fechamento de caixa</h2><p>Os resumos permanecem mesmo depois que os pedidos detalhados forem apagados.</p></div></div>{closings.length?<div className="tableWrap"><table className="dataTable"><thead><tr><th>Fechado em</th><th>Pedidos</th><th>Cancelados</th><th>Pix</th><th>Dinheiro</th><th>Cartão</th><th>Faturamento</th></tr></thead><tbody>{closings.map((closing:any)=><tr key={closing.id}><td>{new Date(closing.closed_at).toLocaleString('pt-BR')}</td><td>{closing.orders_count}</td><td>{closing.cancelled_orders_count}</td><td>{formatBRL(Number(closing.pix_sales||0))}</td><td>{formatBRL(Number(closing.cash_sales||0))}</td><td>{formatBRL(Number(closing.card_sales||0))}</td><td><strong>{formatBRL(Number(closing.gross_sales||0))}</strong></td></tr>)}</tbody></table></div>:<div className="reportEmpty">Nenhum fechamento de caixa registrado ainda.</div>}</section>
+      <section className="panelCard reportChartCard"><div className="panelTitle"><div><h2>Vendas por dia</h2><p>Pedidos cancelados não entram no faturamento.</p></div><strong>{formatBRL(sales)}</strong></div>{dailySales.some((entry)=>entry.total>0)?<><div className="reportChart" style={{gridTemplateColumns:`repeat(${dailySales.length}, minmax(7px, 1fr))`}}>{dailySales.map((entry)=><div className="reportBarColumn" key={entry.key} title={`${entry.label}: ${formatBRL(entry.total)}`}><div className="reportBar" style={{height:`${Math.max(entry.total?8:2,Math.round((entry.total/maxDaily)*100))}%`}}></div></div>)}</div><div className="reportChartRange"><span>{dailySales[0]?.label}</span><span></span><span>{dailySales[dailySales.length-1]?.label}</span></div></>:<div className="reportEmpty">Ainda não há vendas neste período.</div>}</section>
+      <div className="reportGrid"><section className="panelCard"><div className="panelTitle"><div><h2>Produtos mais vendidos</h2><p>Ranking dos pedidos ainda disponíveis.</p></div></div>{topProducts.length?<div className="rankList realRankList">{topProducts.map((product,index)=><div key={`${product.name}-${index}`}><span>{index+1}</span><b>📦</b><div><strong>{product.name}</strong><small>{product.quantity} unidade(s)</small></div><em>{formatBRL(product.revenue)}</em></div>)}</div>:<div className="reportEmpty">Nenhum produto vendido no período.</div>}</section><section className="panelCard"><div className="panelTitle"><div><h2>Formas de pagamento</h2><p>Como os clientes pagaram.</p></div></div>{paymentBreakdown.length?<div className="reportBreakdownList">{paymentBreakdown.map((entry)=><div key={entry.method}><span className="reportBreakdownIcon"><CreditCard size={18}/></span><div><strong>{entry.method}</strong><small>{entry.count} pedido(s)</small></div><em>{formatBRL(entry.total)}</em></div>)}</div>:<div className="reportEmpty">Sem pagamentos neste período.</div>}</section></div>
+      <section className="panelCard"><div className="panelTitle"><div><h2>Delivery x retirada</h2><p>Compare os canais usados pelos clientes.</p></div></div><div className="serviceReportGrid">{serviceBreakdown.map((entry)=><div key={entry.label}><span>{entry.icon}</span><div><strong>{entry.label}</strong><small>{entry.count} pedido(s)</small></div><em>{formatBRL(entry.total)}</em></div>)}</div></section>
     </>}
   </div>
+}
+
+function ReportOrdersTable({rows}:{rows:any[]}){
+  if(!rows.length)return <div className="reportEmpty">Nenhum pedido disponível neste período.</div>
+  return <div className="tableWrap"><table className="dataTable reportOrdersTable"><thead><tr><th>Pedido</th><th>Data</th><th>Cliente</th><th>Tipo</th><th>Pagamento</th><th>Status</th><th>Total</th></tr></thead><tbody>{rows.map((order:any)=>{const customer=Array.isArray(order.customer)?order.customer[0]:order.customer;const pay:Record<string,string>={pix:'Pix',cash:'Dinheiro',card_on_delivery:'Cartão'};return <tr key={order.id}><td><strong>#{order.order_number||String(order.id).slice(0,6)}</strong></td><td>{new Date(order.created_at).toLocaleString('pt-BR')}</td><td>{customer?.name||'Cliente'}</td><td>{order.order_type==='delivery'?'Delivery':'Retirada'}</td><td>{pay[order.payment_method]||order.payment_method}</td><td><span className={`orderStatus ${order.status}`}>{statusLabel[order.status]||order.status}</span></td><td><strong>{formatBRL(Number(order.total||0))}</strong></td></tr>})}</tbody></table></div>
 }
 
 function MyStore() {
@@ -1273,6 +1221,9 @@ function MyStore() {
   const [bannerPreview, setBannerPreview] = useState('')
   const [success, setSuccess] = useState('')
   const [error, setError] = useState('')
+  const [pixAutoEnabled, setPixAutoEnabled] = useState(false)
+  const [mercadoPagoToken, setMercadoPagoToken] = useState('')
+  const [savingGateway, setSavingGateway] = useState(false)
   const [authExpired, setAuthExpired] = useState(false)
   const [hours, setHours] = useState<OpeningHours>({
     mon:{enabled:true,open:'08:00',close:'18:00'}, tue:{enabled:true,open:'08:00',close:'18:00'}, wed:{enabled:true,open:'08:00',close:'18:00'},
@@ -1417,9 +1368,9 @@ function MyStore() {
       </section>
 
       <section className="panelCard">
-        <div className="panelTitle"><div><h2>Contato e endereço</h2><p>Informações exibidas no cardápio e usadas para retirada.</p></div></div>
+        <div className="panelTitle"><div><h2>Contato, endereço e área de atuação</h2><p>A cidade e o estado também definem onde o delivery pode receber pedidos.</p></div></div>
         <label>Rua / endereço<input value={address} onChange={(e)=>setAddress(e.target.value)} placeholder="Rua, número e bairro"/></label>
-        <div className="formGrid two"><label>Cidade<input value={city} onChange={(e)=>setCity(e.target.value)} placeholder="Araguaína"/></label><label>Estado<input value={stateCode} onChange={(e)=>setStateCode(e.target.value.toUpperCase().slice(0,2))} placeholder="TO" maxLength={2}/></label></div>
+        <div className="formGrid two"><label>Cidade<input value={city} onChange={(e)=>setCity(e.target.value)} placeholder="Araguaína"/></label><label>Estado / UF<input value={stateCode} onChange={(e)=>setStateCode(e.target.value.toUpperCase().slice(0,2))} placeholder="TO" maxLength={2}/></label></div><div className="serviceAreaOwnerNotice"><strong>Área de atuação do delivery</strong><span>O checkout aceitará CEPs desta cidade/UF e preencherá rua, bairro e cidade automaticamente. O cliente poderá corrigir os dados quando necessário.</span></div>
       </section>
 
       <section className="panelCard">
@@ -1435,6 +1386,117 @@ function MyStore() {
       <div className="storeSaveBar"><div><strong>{isOpen ? 'Loja aberta' : 'Loja fechada'}</strong><span>As alterações aparecem na página pública assim que você salvar.</span></div><button className="button" disabled={saving}>{saving ? 'Salvando...' : 'Salvar minha loja'}</button></div>
     </form>
   </div>
+}
+
+function MessageTemplatesSettings({ storeId }: { storeId: string }) {
+  const [templates, setTemplates] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
+  const [modal, setModal] = useState(false)
+  const [editing, setEditing] = useState<any>(null)
+  const [deleting, setDeleting] = useState<any>(null)
+
+  async function loadTemplates() {
+    if (!supabase) return
+    setLoading(true)
+    const { data, error: loadError } = await supabase.from('store_message_templates').select('*').eq('store_id', storeId).order('sort_order').order('created_at')
+    if (loadError) setError(loadError.message)
+    else setTemplates(data || [])
+    setLoading(false)
+  }
+
+  useEffect(() => { loadTemplates() }, [storeId])
+
+  function openNew() { setEditing(null); setModal(true); setError(''); setSuccess('') }
+  function openEdit(item: any) { setEditing(item); setModal(true); setError(''); setSuccess('') }
+
+  async function saveTemplate(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!supabase) return
+    setSaving(true); setError(''); setSuccess('')
+    const form = new FormData(event.currentTarget)
+    const payload = {
+      store_id: storeId,
+      name: String(form.get('name') || '').trim(),
+      message: String(form.get('message') || '').trim(),
+      active: form.get('active') === 'on',
+      sort_order: Number(form.get('sort_order') || 0),
+    }
+    const result = editing
+      ? await supabase.from('store_message_templates').update(payload).eq('id', editing.id).select('*').single()
+      : await supabase.from('store_message_templates').insert(payload).select('*').single()
+    if (result.error || !result.data) setError(result.error?.message || 'Não foi possível salvar a mensagem.')
+    else {
+      setTemplates((current) => editing ? current.map((item) => item.id === editing.id ? result.data : item).sort((a,b)=>a.sort_order-b.sort_order) : [...current, result.data].sort((a,b)=>a.sort_order-b.sort_order))
+      setModal(false); setEditing(null); setSuccess('Mensagem salva.')
+    }
+    setSaving(false)
+  }
+
+  async function deleteTemplate() {
+    if (!supabase || !deleting) return
+    setSaving(true); setError('')
+    const { error: deleteError } = await supabase.from('store_message_templates').delete().eq('id', deleting.id)
+    if (deleteError) setError(deleteError.message)
+    else { setTemplates((current)=>current.filter((item)=>item.id!==deleting.id)); setDeleting(null); setSuccess('Mensagem excluída.') }
+    setSaving(false)
+  }
+
+  return <section className="panelCard messageTemplateSettings">
+    <div className="panelTitle"><div><h2>Mensagens rápidas para clientes</h2><p>Crie textos que aparecem como botões dentro de cada pedido. O WhatsApp abre com a mensagem pronta.</p></div><button className="button secondary" onClick={openNew}><Plus size={16}/> Nova mensagem</button></div>
+    <div className="templateVariableHelp"><strong>Campos automáticos:</strong><span>{'{cliente}'} · {'{pedido}'} · {'{loja}'} · {'{total}'} · {'{pagamento}'} · {'{recebimento}'} · {'{endereco}'}</span></div>
+    {error && <div className="infoAlert">{error}</div>}{success && <div className="successAlert">{success}</div>}
+    {loading ? <p className="orderMuted">Carregando mensagens...</p> : templates.length === 0 ? <div className="deliveryEmpty"><MessageCircle/><div><strong>Nenhuma mensagem criada</strong><span>Crie mensagens como “Pagamento confirmado” ou “Saiu para entrega”.</span></div></div> : <div className="messageTemplateList">{templates.map((item)=><div key={item.id}><MessageCircle size={18}/><div><strong>{item.name}</strong><small>{item.message}</small></div><span className={item.active ? 'activePill' : 'inactivePill'}>{item.active ? 'Ativa' : 'Oculta'}</span><div className="categoryActions"><button className="miniButton" onClick={()=>openEdit(item)}><Pencil size={14}/> Editar</button><button className="miniButton dangerMiniButton" onClick={()=>setDeleting(item)}><Trash2 size={14}/> Excluir</button></div></div>)}</div>}
+    {modal && <div className="modalBackdrop" onMouseDown={(event)=>{if(event.target===event.currentTarget)setModal(false)}}><div className="modalCard messageTemplateModal"><div className="modalTitle"><div><h2>{editing ? 'Editar mensagem' : 'Nova mensagem'}</h2><p>O lojista poderá usar esta mensagem em qualquer pedido.</p></div><button onClick={()=>setModal(false)}>×</button></div><form onSubmit={saveTemplate}><label>Nome do botão<input name="name" required maxLength={60} defaultValue={editing?.name || ''} placeholder="Ex.: Pagamento confirmado"/></label><label>Mensagem<textarea name="message" required rows={6} defaultValue={editing?.message || ''} placeholder="Olá, {cliente}! Seu pedido #{pedido} da {loja}..."/></label><div className="formGrid two"><label>Ordem<input name="sort_order" type="number" min="0" defaultValue={editing?.sort_order ?? templates.length}/></label><label className="checkLine"><input name="active" type="checkbox" defaultChecked={editing ? Boolean(editing.active) : true}/> Mostrar nos pedidos</label></div><button className="button full large" disabled={saving}>{saving ? 'Salvando...' : 'Salvar mensagem'}</button></form></div></div>}
+    {deleting && <div className="modalBackdrop"><div className="modalCard confirmDeleteModal"><div className="deleteIcon"><Trash2 size={26}/></div><h2>Excluir “{deleting.name}”?</h2><p>Ela deixará de aparecer nos pedidos. Você poderá criar outra mensagem quando quiser.</p><div className="confirmDeleteActions"><button className="button secondary" onClick={()=>setDeleting(null)}>Cancelar</button><button className="button dangerButton" onClick={deleteTemplate} disabled={saving}>{saving ? 'Excluindo...' : 'Excluir mensagem'}</button></div></div></div>}
+  </section>
+}
+
+
+function OrderAlertSettings({ store, onSaved }: { store: any; onSaved: (next: any) => void }) {
+  const [soundEnabled, setSoundEnabled] = useState(store?.new_order_sound_enabled !== false)
+  const [flashEnabled, setFlashEnabled] = useState(store?.new_order_flash_enabled !== false)
+  const [previewFlash, setPreviewFlash] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
+
+  useEffect(() => {
+    setSoundEnabled(store?.new_order_sound_enabled !== false)
+    setFlashEnabled(store?.new_order_flash_enabled !== false)
+  }, [store?.id, store?.new_order_sound_enabled, store?.new_order_flash_enabled])
+
+  async function saveAlerts() {
+    if (!supabase || !store?.id) return
+    setSaving(true); setError(''); setSuccess('')
+    const { data, error: updateError } = await supabase
+      .from('stores')
+      .update({ new_order_sound_enabled: soundEnabled, new_order_flash_enabled: flashEnabled })
+      .eq('id', store.id)
+      .select('*')
+      .single()
+    if (updateError) setError(updateError.message)
+    else { onSaved(data); setSuccess('Alertas de novos pedidos atualizados.') }
+    setSaving(false)
+  }
+
+  function testFlash() {
+    setPreviewFlash(true)
+    window.setTimeout(() => setPreviewFlash(false), 3500)
+  }
+
+  return <section className="panelCard orderAlertSettings">
+    <div className="panelTitle"><div><h2>Alertas de novos pedidos</h2><p>Escolha como o painel avisa quando chegar um pedido novo.</p></div><span className="securityRecommended"><BellRing size={16}/> Tempo real</span></div>
+    {error && <div className="infoAlert">{error}</div>}{success && <div className="successAlert">{success}</div>}
+    <div className="alertPreferenceGrid">
+      <div className="alertPreferenceCard"><div className="alertPreferenceIcon">{soundEnabled ? <Volume2/> : <VolumeX/>}</div><div><strong>Som de novo pedido</strong><span>Toca um aviso curto quando um pedido entrar no painel.</span><small>O navegador pode exigir uma primeira interação antes de permitir sons automáticos.</small></div><label className="switch"><input type="checkbox" checked={soundEnabled} onChange={(e)=>setSoundEnabled(e.target.checked)}/><i></i></label></div>
+      <div className="alertPreferenceCard"><div className="alertPreferenceIcon"><BellRing/></div><div><strong>Destacar e piscar pedido novo</strong><span>O pedido recém-chegado fica destacado por 30 segundos na visão geral.</span><small>Também aparece um aviso com botão “Ver pedido”.</small></div><label className="switch"><input type="checkbox" checked={flashEnabled} onChange={(e)=>setFlashEnabled(e.target.checked)}/><i></i></label></div>
+    </div>
+    <div className={`newOrderPreview ${previewFlash ? 'pulse' : ''}`}><BellRing/><div><strong>Exemplo: novo pedido #123</strong><span>Cliente teste · R$ 35,00</span></div></div>
+    <div className="alertPreferenceActions"><button className="button secondary" type="button" onClick={playNewOrderSound}><Volume2 size={16}/> Testar som</button><button className="button secondary" type="button" onClick={testFlash}><BellRing size={16}/> Testar animação</button><button className="button" type="button" disabled={saving} onClick={saveAlerts}>{saving ? 'Salvando...' : 'Salvar alertas'}</button></div>
+  </section>
 }
 
 function SettingsPage() {
@@ -1476,18 +1538,24 @@ function SettingsPage() {
       <div className="accountInfoGrid"><div><span>E-mail</span><strong>{email || 'Não informado'}</strong></div><div><span>Loja</span><strong>{store?.name || '—'}</strong></div><div><span>Endereço público</span><strong>/loja/{store?.slug || '—'}</strong></div></div>
     </section>
 
-    <section className="panelCard subscriptionPanel">
+    <SecuritySettings />
+
+    {store && <OrderAlertSettings store={store} onSaved={setStore}/>}
+
+<section className="panelCard subscriptionPanel">
       <div className="panelTitle"><div><h2>Assinatura</h2><p>Plano comercial da sua loja no Pedevo.</p></div><span className={`subscriptionStatus ${meta.tone}`}>{meta.label}</span></div>
       <div className="subscriptionHero">
-        <div><span>Plano Pedevo</span><strong>{subscription?.status === 'active' ? `${formatBRL(Number(subscription?.monthly_price || 19.9))}/mês` : 'Lançamento'}</strong><small>Adesão {formatBRL(Number(subscription?.signup_fee || 29.9))} • {subscription?.included_days || 60} dias incluídos • depois {formatBRL(Number(subscription?.monthly_price || 19.9))}/mês</small></div>
+        <div><span>Plano atual</span><strong>{subscription?.plan_name || 'Pedevo Essencial'}</strong><small>Ativação {formatBRL(Number(subscription?.signup_fee || 0))} • {subscription?.included_days || 0} dia(s) de acesso inicial • renovação {formatBRL(Number(subscription?.monthly_price || 0))} a cada {subscription?.renewal_months || 1} mês(es)</small></div>
         <div className={`subscriptionAccess ${meta.canOrder ? 'ok' : 'paused'}`}><ShieldCheck size={18}/><span>{meta.canOrder ? 'Pedidos liberados' : 'Pedidos pausados'}</span></div>
       </div>
       {subscription?.status === 'trial' && <div className="trialProgress"><div><span>Período inicial</span><strong>{trialDays} dia(s) restante(s)</strong></div><div className="trialProgressTrack"><i style={{width:`${progress}%`}}></i></div><small>Válido até {dateBR(subscription.included_until)}.</small></div>}
-      {subscription?.status === 'pending' && <div className="subscriptionActionNote"><AlertTriangle size={18}/><div><strong>Ativação pendente</strong><span>Após a confirmação da adesão de {formatBRL(Number(subscription.signup_fee || 29.9))}, seus {subscription.included_days || 60} dias começam a contar.</span></div></div>}
+      {subscription?.status === 'pending' && <div className="subscriptionActionNote"><AlertTriangle size={18}/><div><strong>Ativação pendente</strong><span>Após a confirmação do pagamento inicial de {formatBRL(Number(subscription.signup_fee || 0))}, o acesso do plano {subscription.plan_name || 'Pedevo'} começa a contar.</span></div></div>}
       {['overdue','blocked'].includes(subscription?.status) && <div className="subscriptionActionNote danger"><AlertTriangle size={18}/><div><strong>Regularização necessária</strong><span>{meta.detail} Seus dados continuam salvos no Pedevo.</span></div></div>}
       {subscription?.status === 'active' && <div className="subscriptionDates"><div><span>Último pagamento</span><strong>{dateBR(subscription.last_payment_at)}</strong></div><div><span>Próxima cobrança</span><strong>{dateBR(subscription.current_period_end || subscription.next_charge_at)}</strong></div></div>}
-      <p className="subscriptionFootnote">Nesta fase, ativações e mensalidades são confirmadas pelo painel administrativo Pedevo. A cobrança automática será conectada em uma etapa posterior.</p>
+      <p className="subscriptionFootnote">O plano e os valores são definidos pela administração do Pedevo. Alterações comerciais futuras não mudam retroativamente um período já pago; passam a valer conforme a configuração aplicada à assinatura.</p>
     </section>
+
+    {store && <MessageTemplatesSettings storeId={store.id}/>}
 
     <section className="panelCard">
       <div className="panelTitle"><div><h2>Atalhos de configuração</h2><p>As configurações reais da loja ficam nestas áreas.</p></div></div>

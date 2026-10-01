@@ -66,12 +66,14 @@ export type Store = {
   pickupEnabled: boolean
   pixEnabled: boolean
   pixKey?: string
+  pixAutoEnabled?: boolean
   cashEnabled: boolean
   cardOnDeliveryEnabled: boolean
   ageRestrictedSales: boolean
   address: string
   city?: string
   state?: string
+  timezone?: string
   openingHours?: OpeningHours
   open: boolean
   deliveryZones?: DeliveryZone[]

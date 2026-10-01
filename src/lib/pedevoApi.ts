@@ -5,6 +5,8 @@ export type CreateStoreInput = {
   businessType: string
   whatsapp: string
   address: string
+  city: string
+  state: string
   delivery: boolean
   pickup: boolean
   pix: boolean
@@ -53,6 +55,8 @@ export async function createStoreWithDefaults(input: CreateStoreInput) {
       business_type: input.businessType,
       whatsapp: input.whatsapp,
       address_line: input.address,
+      city: input.city,
+      state: input.state.toUpperCase(),
       delivery_enabled: input.delivery,
       pickup_enabled: input.pickup,
       pix_enabled: input.pix,
@@ -69,6 +73,19 @@ export async function createStoreWithDefaults(input: CreateStoreInput) {
   await supabase.from('categories').insert(
     preset.map(([name, icon], index) => ({ store_id: store.id, name, icon, sort_order: index })),
   )
+
+  // Se o visitante escolheu um plano/promoção na página pública, aplica a preferência
+  // enquanto a assinatura ainda está pendente. Caso não exista preferência, o banco
+  // mantém automaticamente o plano padrão ativo.
+  try {
+    const selectedPlanCode = localStorage.getItem('pedevo-selected-plan')
+    if (selectedPlanCode) {
+      await supabase.rpc('select_initial_subscription_plan', { p_store_id: store.id, p_plan_code: selectedPlanCode })
+      localStorage.removeItem('pedevo-selected-plan')
+    }
+  } catch {
+    // LocalStorage indisponível não impede a criação da loja.
+  }
 
   return { demo: false, store, error: null }
 }
@@ -138,6 +155,7 @@ export async function placeOrder(input: {
   storeId: string
   customerName: string
   customerWhatsapp: string
+  customerEmail?: string
   orderType: 'delivery' | 'pickup'
   paymentMethod: 'pix' | 'cash' | 'card_on_delivery'
   deliveryAddress: Record<string, string> | null
@@ -147,10 +165,11 @@ export async function placeOrder(input: {
   items: Array<{ productId: string; quantity: number }>
 }) {
   if (!supabase) return { data: null, error: new Error('Supabase não configurado') }
-  return supabase.rpc('place_order', {
+  return supabase.rpc('place_order_v2', {
     p_store_id: input.storeId,
     p_customer_name: input.customerName,
     p_customer_whatsapp: input.customerWhatsapp,
+    p_customer_email: input.customerEmail || null,
     p_order_type: input.orderType,
     p_payment_method: input.paymentMethod,
     p_delivery_address: input.deliveryAddress,
@@ -161,7 +180,97 @@ export async function placeOrder(input: {
   })
 }
 
+export async function createAutomaticPixPayment(input: {
+  orderId: string
+  trackingToken: string
+  payerEmail: string
+  payerDocument: string
+}) {
+  if (!supabase) return { data: null, error: new Error('Supabase não configurado') }
+  return supabase.functions.invoke('create-pix-payment', { body: input })
+}
+
+export async function createManualPixPayment(input: {
+  orderId: string
+  trackingToken: string
+}) {
+  if (!supabase) return { data: null, error: new Error('Supabase não configurado') }
+
+  const result = await supabase.functions.invoke('create-manual-pix', { body: input })
+  if (!result.error) return result
+
+  let message = result.error.message || 'Não foi possível gerar o Pix.'
+  try {
+    const context = (result.error as any)?.context
+    if (context && typeof context.clone === 'function') {
+      const response = context.clone()
+      const body = await response.json().catch(() => null)
+      if (body?.error) message = String(body.error)
+    }
+  } catch {
+    // Mantém a mensagem original caso a resposta não possa ser lida.
+  }
+
+  return { data: result.data, error: new Error(message) }
+}
+
+export async function markManualPixPaid(orderId: string) {
+  if (!supabase) return { data: null, error: new Error('Supabase não configurado') }
+  return supabase.rpc('owner_mark_pix_paid', { p_order_id: orderId })
+}
+
+export async function expireAutomaticPixPayment(orderId: string, trackingToken: string) {
+  if (!supabase) return { data: null, error: new Error('Supabase não configurado') }
+  return supabase.functions.invoke('expire-single-pix', { body: { orderId, trackingToken } })
+}
+
+export async function getPublicOrderTracking(orderId: string, trackingToken: string) {
+  if (!supabase) return { data: null, error: new Error('Supabase não configurado') }
+
+  const result = await supabase.functions.invoke('track-order', {
+    body: { orderId, trackingToken },
+  })
+  if (!result.error) return result
+
+  let message = result.error.message || 'Não foi possível atualizar o pedido.'
+  try {
+    const context = (result.error as any)?.context
+    if (context && typeof context.clone === 'function') {
+      const response = context.clone()
+      const body = await response.json().catch(() => null)
+      if (body?.error) message = String(body.error)
+    }
+  } catch {
+    // Mantém a mensagem original se a resposta não puder ser lida.
+  }
+  return { data: result.data, error: new Error(message) }
+}
+
+export async function sendOrderWhatsapp(input: {
+  orderId: string
+  trackingToken?: string
+  event: 'order_received' | 'payment_approved' | 'out_for_delivery'
+}) {
+  if (!supabase) return { data: null, error: new Error('Supabase não configurado') }
+  return supabase.functions.invoke('order-whatsapp', { body: input })
+}
+
+export async function saveMercadoPagoToken(storeId: string, accessToken: string) {
+  if (!supabase) return { data: null, error: new Error('Supabase não configurado') }
+  return supabase.functions.invoke('save-mercadopago-token', { body: { storeId, accessToken } })
+}
+
 export async function getStoreOrderingStatus(storeId: string) {
   if (!supabase) return { data: { can_order: true, code: 'demo', message: 'Pedidos disponíveis.' }, error: null }
   return supabase.rpc('get_store_ordering_status', { p_store_id: storeId })
+}
+
+
+export async function getPublicSaasPlans() {
+  if (!supabase) return { data: [], error: null }
+  return supabase.rpc('get_active_saas_plans')
+}
+
+export function rememberSelectedSaasPlan(code: string) {
+  try { localStorage.setItem('pedevo-selected-plan', code) } catch { /* ignore */ }
 }

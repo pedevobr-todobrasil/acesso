@@ -1,8 +1,10 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
+import MfaGate from './components/MfaGate'
 import Auth from './pages/Auth'
 import Cart from './pages/Cart'
 import Checkout from './pages/Checkout'
 import Landing from './pages/Landing'
+import MfaVerify from './pages/MfaVerify'
 import Onboarding from './pages/Onboarding'
 import OrderSuccess from './pages/OrderSuccess'
 import OwnerPanel from './pages/OwnerPanel'
@@ -21,9 +23,10 @@ export default function App() {
     <Route path="/entrar" element={<Auth mode="login" />} />
     <Route path="/admin/entrar" element={<Auth mode="login" area="admin" />} />
     <Route path="/cadastro" element={<Auth mode="signup" />} />
-    <Route path="/onboarding" element={<Onboarding />} />
-    <Route path="/painel/*" element={<OwnerPanel />} />
-    <Route path="/admin" element={<SaaSAdmin />} />
+    <Route path="/onboarding" element={<MfaGate area="owner"><Onboarding /></MfaGate>} />
+    <Route path="/seguranca/verificar" element={<MfaVerify />} />
+    <Route path="/painel/*" element={<MfaGate area="owner"><OwnerPanel /></MfaGate>} />
+    <Route path="/admin" element={<MfaGate area="admin"><SaaSAdmin /></MfaGate>} />
     <Route path="*" element={<Navigate to="/" replace />} />
   </Routes>
 }
