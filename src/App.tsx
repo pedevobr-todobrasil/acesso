@@ -19,6 +19,7 @@ export default function App() {
     <Route path="/checkout" element={<Checkout />} />
     <Route path="/pedido-concluido" element={<OrderSuccess />} />
     <Route path="/entrar" element={<Auth mode="login" />} />
+    <Route path="/admin/entrar" element={<Auth mode="login" area="admin" />} />
     <Route path="/cadastro" element={<Auth mode="signup" />} />
     <Route path="/onboarding" element={<Onboarding />} />
     <Route path="/painel/*" element={<OwnerPanel />} />

@@ -173,7 +173,7 @@ export default function SaaSAdmin() {
   }
 
   if (!authorized) {
-    return <div className="adminGate"><Brand /><ShieldCheck size={46} /><h1>Área administrativa Pedevo</h1><p>Este acesso é exclusivo para administradores cadastrados no Supabase.</p>{error && <div className="infoAlert">{error}</div>}<Link className="button" to="/entrar">Entrar com conta administrativa</Link><Link className="textLink" to="/">Voltar ao site</Link></div>
+    return <div className="adminGate"><Brand /><ShieldCheck size={46} /><h1>Área administrativa Pedevo</h1><p>Este acesso é exclusivo para administradores cadastrados no Supabase.</p>{error && <div className="infoAlert">{error}</div>}<Link className="button" to="/admin/entrar">Entrar com conta administrativa</Link><Link className="textLink" to="/">Voltar ao site</Link></div>
   }
 
   const navItems: Array<{ key: AdminSection; label: string; icon: any }> = [
