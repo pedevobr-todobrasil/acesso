@@ -19,6 +19,7 @@ export type Category = {
 
 export type Product = {
   id: string
+  storeId?: string
   name: string
   description: string
   price: number
@@ -32,6 +33,23 @@ export type Product = {
   featured?: boolean
 }
 
+export type DayHours = {
+  enabled: boolean
+  open: string
+  close: string
+}
+
+export type OpeningHours = Partial<Record<'sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat', DayHours>>
+
+export type DeliveryZone = {
+  id: string
+  name: string
+  fee: number
+  etaMinMinutes?: number | null
+  etaMaxMinutes?: number | null
+  active: boolean
+}
+
 export type Store = {
   id: string
   name: string
@@ -39,17 +57,24 @@ export type Store = {
   type: StoreType
   description: string
   whatsapp: string
+  logoUrl?: string
+  bannerUrl?: string
   primaryColor: string
   minOrder: number
   deliveryFee: number
   deliveryEnabled: boolean
   pickupEnabled: boolean
   pixEnabled: boolean
+  pixKey?: string
   cashEnabled: boolean
   cardOnDeliveryEnabled: boolean
   ageRestrictedSales: boolean
   address: string
+  city?: string
+  state?: string
+  openingHours?: OpeningHours
   open: boolean
+  deliveryZones?: DeliveryZone[]
 }
 
 export type CartItem = {

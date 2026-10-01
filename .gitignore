@@ -1,0 +1,20 @@
+# Dependências
+node_modules/
+
+# Variáveis locais / Supabase
+.env
+.env.local
+.env.*.local
+
+# Build
+dist/
+
+# Logs
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/

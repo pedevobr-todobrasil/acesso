@@ -160,3 +160,8 @@ export async function placeOrder(input: {
     p_items: input.items.map((item) => ({ product_id: item.productId, quantity: item.quantity })),
   })
 }
+
+export async function getStoreOrderingStatus(storeId: string) {
+  if (!supabase) return { data: { can_order: true, code: 'demo', message: 'Pedidos disponíveis.' }, error: null }
+  return supabase.rpc('get_store_ordering_status', { p_store_id: storeId })
+}

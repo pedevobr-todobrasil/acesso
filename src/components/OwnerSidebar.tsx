@@ -10,8 +10,11 @@ import {
   Store,
   Tags,
 } from 'lucide-react'
-import { NavLink } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { NavLink, useNavigate } from 'react-router-dom'
 import Brand from './Brand'
+import { getOwnedStore } from '../lib/pedevoApi'
+import { supabase } from '../lib/supabase'
 
 const links = [
   { to: '/painel', label: 'Visão geral', icon: Home, end: true },
@@ -26,12 +29,27 @@ const links = [
 ]
 
 export default function OwnerSidebar() {
+  const [storeName, setStoreName] = useState('Minha loja')
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    getOwnedStore().then(({ data }) => {
+      if (data?.name) setStoreName(data.name)
+    })
+  }, [])
+
+  async function logout(event: React.MouseEvent<HTMLAnchorElement>) {
+    event.preventDefault()
+    if (supabase) await supabase.auth.signOut()
+    navigate('/entrar')
+  }
+
   return (
     <aside className="ownerSidebar">
       <NavLink to="/" className="sidebarBrand"><Brand compact /></NavLink>
       <div className="ownerStoreBadge">
         <span>Loja ativa</span>
-        <strong>Depósito Central</strong>
+        <strong>{storeName}</strong>
       </div>
       <nav className="ownerMenu">
         {links.map(({ to, label, icon: Icon, end }) => (
@@ -40,7 +58,7 @@ export default function OwnerSidebar() {
           </NavLink>
         ))}
       </nav>
-      <NavLink to="/entrar" className="logoutLink"><LogOut size={18} /> Sair</NavLink>
+      <NavLink to="/entrar" onClick={logout} className="logoutLink"><LogOut size={18} /> Sair</NavLink>
     </aside>
   )
 }
