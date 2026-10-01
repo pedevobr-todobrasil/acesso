@@ -1,0 +1,27 @@
+# Pedevo - configuração das Edge Functions
+# Funções chamadas por cliente público, webhook ou cron validam a segurança dentro do próprio código.
+
+[functions.create-manual-pix]
+verify_jwt = false
+
+[functions.create-pix-payment]
+verify_jwt = false
+
+[functions.expire-pix-payments]
+verify_jwt = false
+
+[functions.expire-single-pix]
+verify_jwt = false
+
+[functions.mercadopago-webhook]
+verify_jwt = false
+
+[functions.order-whatsapp]
+verify_jwt = false
+
+[functions.track-order]
+verify_jwt = false
+
+# Esta função é exclusiva do lojista autenticado.
+[functions.save-mercadopago-token]
+verify_jwt = true
