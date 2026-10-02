@@ -22,16 +22,18 @@ function qrSource(value?: string) {
   return value
 }
 
-export default function SecuritySettings({ compact = false }: { compact?: boolean }) {
+export default function SecuritySettings({ compact = false, logoutPath = '/entrar' }: { compact?: boolean; logoutPath?: string }) {
   const [user, setUser] = useState<any>(null)
   const [factors, setFactors] = useState<any[]>([])
   const [pending, setPending] = useState<PendingFactor | null>(null)
   const [phone, setPhone] = useState('')
   const [code, setCode] = useState('')
+  const [newEmail, setNewEmail] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [loading, setLoading] = useState(true)
   const [working, setWorking] = useState(false)
+  const [emailWorking, setEmailWorking] = useState(false)
   const [passwordWorking, setPasswordWorking] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
@@ -45,6 +47,7 @@ export default function SecuritySettings({ compact = false }: { compact?: boolea
     ])
     if (userResult.error) setError(userResult.error.message)
     setUser(userResult.data.user || null)
+    setNewEmail(userResult.data.user?.email || '')
     const data = factorsResult.data || {}
     const all = data.all || [...(data.totp || []), ...(data.phone || [])]
     setFactors(all.filter((item: any) => item.status === 'verified'))
@@ -64,9 +67,28 @@ export default function SecuritySettings({ compact = false }: { compact?: boolea
     if (newPassword !== confirmPassword) { setError('A confirmação da senha não confere.'); return }
     setPasswordWorking(true)
     const result = await supabase.auth.updateUser({ password: newPassword })
+    if (result.error) {
+      setError(result.error.message)
+      setPasswordWorking(false)
+      return
+    }
+    setNewPassword(''); setConfirmPassword('')
+    await supabase.auth.signOut({ scope: 'global' })
+    window.location.hash = `#${logoutPath}`
+  }
+
+  async function changeEmail(event: FormEvent) {
+    event.preventDefault()
+    if (!supabase || !user?.email) return
+    setError(''); setSuccess('')
+    const normalized = newEmail.trim().toLowerCase()
+    if (!/^\S+@\S+\.\S+$/.test(normalized)) { setError('Informe um e-mail válido.'); return }
+    if (normalized === String(user.email).toLowerCase()) { setError('Digite um e-mail diferente do atual.'); return }
+    setEmailWorking(true)
+    const result = await supabase.auth.updateUser({ email: normalized })
     if (result.error) setError(result.error.message)
-    else { setSuccess('Senha alterada com sucesso.'); setNewPassword(''); setConfirmPassword('') }
-    setPasswordWorking(false)
+    else setSuccess('Solicitação enviada. Confirme a alteração pelos e-mails de segurança enviados pelo Supabase. Depois da confirmação, use o novo e-mail no próximo login.')
+    setEmailWorking(false)
   }
 
   async function resendEmailConfirmation() {
@@ -139,15 +161,16 @@ export default function SecuritySettings({ compact = false }: { compact?: boolea
     {success && <div className="successAlert">{success}</div>}
 
     <div className="securityOptionGrid">
-      <article className="securityOptionCard">
+      <article className="securityOptionCard emailSecurityCard">
         <div className="securityOptionIcon"><Mail/></div>
-        <div><strong>E-mail da conta</strong><span>{user?.email || 'Não informado'}</span><small>Usado para acesso, confirmação da conta e recuperação de senha. E-mail não é um segundo fator MFA.</small></div>
-        {user?.email_confirmed_at ? <span className="securityOk"><CheckCircle2/> Confirmado</span> : <div className="securityActions"><span className="securityNeutral">Pendente</span><button className="miniButton" disabled={working} onClick={resendEmailConfirmation}>Reenviar confirmação</button></div>}
+        <div><strong>E-mail / usuário de acesso</strong><span>Atual: {user?.email || 'Não informado'}</span><small>Ao trocar o e-mail, o Supabase envia confirmações de segurança. O novo endereço passa a ser seu usuário de login depois da confirmação.</small></div>
+        <div className="securityActions">{user?.email_confirmed_at ? <span className="securityOk"><CheckCircle2/> Confirmado</span> : <><span className="securityNeutral">Pendente</span><button className="miniButton" disabled={working} onClick={resendEmailConfirmation}>Reenviar confirmação</button></>}</div>
+        <form className="emailChangeForm" onSubmit={changeEmail}><input type="email" autoComplete="email" value={newEmail} onChange={(e)=>setNewEmail(e.target.value)} placeholder="novo@email.com" required/><button className="button secondary" disabled={emailWorking}>{emailWorking ? 'Enviando...' : 'Alterar e-mail'}</button></form>
       </article>
 
       <article className="securityOptionCard passwordSecurityCard">
         <div className="securityOptionIcon"><LockKeyhole/></div>
-        <div><strong>Trocar senha</strong><span>Defina uma nova senha para entrar no painel.</span><small>Use pelo menos 8 caracteres e evite repetir senhas de outros serviços.</small></div>
+        <div><strong>Trocar senha</strong><span>Defina uma nova senha para entrar no painel.</span><small>Depois da alteração, o Pedevo encerra a sessão automaticamente e você deverá entrar novamente com a nova senha.</small></div>
         <form className="passwordChangeForm" onSubmit={changePassword}><input type="password" autoComplete="new-password" value={newPassword} onChange={(e)=>setNewPassword(e.target.value)} placeholder="Nova senha"/><input type="password" autoComplete="new-password" value={confirmPassword} onChange={(e)=>setConfirmPassword(e.target.value)} placeholder="Confirmar nova senha"/><button className="button secondary" disabled={passwordWorking}>{passwordWorking ? 'Alterando...' : 'Alterar senha'}</button></form>
       </article>
 
